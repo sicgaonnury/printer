@@ -1,0 +1,99 @@
+# ─────────────────────────────────────────────────────────────
+#  서인천고 공용 프린터 제어 시스템 — exe 자동 빌드
+#
+#  v 로 시작하는 태그(예: v1.5.0)를 올리면
+#    1. GitHub 의 윈도우 서버에서 exe 를 만들고
+#    2. 그 태그의 릴리스에 exe 를 붙인다.
+#  제어 컴퓨터들은 기존처럼 자동 업데이트로 새 버전을 받아간다.
+#
+#  태그 없이 시험 빌드만 해 보고 싶으면:
+#    Actions 탭 → Build Windows exe → Run workflow
+#    (이때는 릴리스를 만들지 않고, 완료 화면의 Artifacts 에서 exe 를 받는다)
+# ─────────────────────────────────────────────────────────────
+name: Build Windows exe
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write        # 릴리스에 파일을 올리기 위해 필요
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    env:
+      PYTHONUTF8: "1"    # 한글 파일 이름이 깨지지 않도록
+      EXE_NAME: "서인천고등학교 공용 프린터 제어 시스템"
+
+    steps:
+      - name: 코드 받기
+        uses: actions/checkout@v4
+
+      - name: 파이썬 준비
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: 패키지 설치
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+          python -m pip install pyinstaller
+
+      # 태그와 프로그램 안의 APP_VERSION 이 다르면 여기서 멈춘다.
+      # (다르면 자동 업데이트가 계속 "새 버전이 있다" 고 잘못 판단한다)
+      - name: 버전 확인
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: pwsh
+        run: |
+          $tag = "${{ github.ref_name }}".TrimStart("v")
+          $line = Select-String -Path school_printer.py -Pattern '^APP_VERSION\s*=\s*"([^"]+)"' | Select-Object -First 1
+          if (-not $line) { Write-Error "school_printer.py 에서 APP_VERSION 을 찾지 못했습니다."; exit 1 }
+          $code = $line.Matches[0].Groups[1].Value
+          Write-Host "태그: $tag / APP_VERSION: $code"
+          if ($tag -ne $code) {
+            Write-Error "태그(v$tag)와 APP_VERSION($code)이 다릅니다. 둘을 맞춘 뒤 다시 올려 주세요."
+            exit 1
+          }
+
+      - name: exe 만들기
+        shell: pwsh
+        run: |
+          python -m PyInstaller `
+            --onefile --windowed `
+            --name $env:EXE_NAME `
+            --icon=icon.ico `
+            --add-data "icon.ico;." `
+            --collect-all customtkinter `
+            school_printer.py
+
+      # 릴리스 첨부 파일은 영문 이름으로 올린다.
+      # GitHub 는 첨부 파일 이름의 한글을 다른 글자로 바꿔버리기 때문이다.
+      # (프로그램의 자동 업데이트는 .exe 로 끝나는 파일을 찾으므로 이름이 달라도 된다)
+      - name: 첨부용 이름 정리
+        shell: pwsh
+        run: |
+          $ver = if ("${{ github.ref_type }}" -eq "tag") { "${{ github.ref_name }}" } else { "test" }
+          Copy-Item "dist/$env:EXE_NAME.exe" "dist/SchoolPrinter-$ver.exe"
+          Get-ChildItem dist
+
+      - name: 릴리스에 올리기
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/SchoolPrinter-${{ github.ref_name }}.exe
+          generate_release_notes: true
+          # 먼저 직접 확인하고 배포하고 싶으면 아래를 true 로 바꾼다.
+          # (초안 상태에서는 제어 컴퓨터들이 새 버전을 받아가지 않는다)
+          draft: false
+
+      - name: 시험 빌드 결과 보관
+        if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: SchoolPrinter-test
+          path: dist/SchoolPrinter-test.exe
