@@ -1,7 +1,0 @@
-# 제어 프로그램에 필요한 패키지
-customtkinter
-pywin32
-pillow
-pymupdf
-openpyxl
-qrcode
