@@ -90,7 +90,7 @@ DB_NAME = "school_printer.db"
 # 프로그램이 스스로 업데이트를 확인하는 일은 없다.
 # 관리자가 버튼을 눌렀을 때만 확인한다.
 # -----------------------------
-APP_VERSION = "1.5.2"
+APP_VERSION = "1.5.3"
 GITHUB_REPO = "sicgaonnury/printer"
 DEFAULT_ADMIN_PASSWORD = "1234"
 
@@ -2159,45 +2159,6 @@ def get_resource_path(file_name):
     return None
 
 
-# 학생증 예시 그림.
-# 어느 부분을 리더기에 대야 하는지 학생이 한눈에 알 수 있도록
-# 첫 화면과 파일 공유 화면에 함께 보여준다.
-CARD_GUIDE_FILE_NAME = "card_guide.png"
-
-# 같은 그림을 화면마다 다시 읽지 않도록 크기별로 기억해 둔다
-_card_guide_cache = {}
-
-
-def load_card_guide_image(height=300):
-    """
-    학생증 예시 그림을 화면에 넣을 수 있는 형태로 돌려준다.
-    파일이 없거나 읽지 못하면 None 을 돌려주고, 그 자리는 비워 둔다.
-    (그림이 없다고 프로그램이 멈추면 안 된다)
-    """
-    if height in _card_guide_cache:
-        return _card_guide_cache[height]
-
-    _card_guide_cache[height] = None
-
-    if Image is None:
-        return None
-
-    path = get_resource_path(CARD_GUIDE_FILE_NAME)
-
-    if not path:
-        return None
-
-    try:
-        source = Image.open(path)
-        width = max(1, int(source.width * height / source.height))
-        image = ctk.CTkImage(light_image=source, size=(width, height))
-    except Exception:
-        return None
-
-    _card_guide_cache[height] = image
-    return image
-
-
 def apply_window_icon(window):
     """창 왼쪽 위와 작업표시줄 아이콘을 icon.ico로 바꾼다."""
     icon_path = get_resource_path(ICON_FILE_NAME)
@@ -4167,7 +4128,7 @@ class PrinterKioskApp:
             while True:
                 state = fetch_report_status()
 
-                if state is not None:
+                if state is not None and not self.direct_result_is_fresher(state):
                     # 화면 조작은 반드시 메인 스레드에서 해야 한다
                     try:
                         self.root.after(0, lambda s=state: self.apply_report_banner(s))
@@ -4177,6 +4138,33 @@ class PrinterKioskApp:
                 time.sleep(max(15, REPORT_CHECK_SECONDS))
 
         threading.Thread(target=worker, daemon=True).start()
+
+    # 직접 확인(Apps Script)한 결과를 이 시간(초) 동안은 GitHub 파일보다 믿는다.
+    # 직접 확인할 때 Apps Script 가 파일도 고쳐 쓰지만, 반영되기까지 잠깐 걸린다.
+    # 그 사이 옛 파일 내용으로 안내가 다시 떴다 사라지는 일을 막는다.
+    DIRECT_RESULT_HOLD_SECONDS = 90
+
+    def remember_direct_result(self, state):
+        """방금 직접 확인한 결과를 기억해 둔다."""
+        self._direct_state = state
+        self._direct_state_at = time.time()
+
+    def direct_result_is_fresher(self, file_state):
+        """
+        GitHub 파일에서 읽은 값을 무시해야 하는지.
+        직접 확인한 지 얼마 안 됐는데 파일이 다른 말을 하면, 파일이 아직
+        옛 내용인 것으로 보고 무시한다.
+        """
+        direct = getattr(self, "_direct_state", None)
+        at = getattr(self, "_direct_state_at", 0)
+
+        if direct is None or time.time() - at > self.DIRECT_RESULT_HOLD_SECONDS:
+            return False
+
+        def key(state):
+            return (state.get("open", 0), state.get("status", ""), str(state.get("id", "")))
+
+        return key(direct) != key(file_state)
 
     def check_report_status_soon(self, delay_seconds=25):
         """
@@ -4193,6 +4181,8 @@ class PrinterKioskApp:
 
             if state is None:
                 return
+
+            self.remember_direct_result(state)
 
             try:
                 self.root.after(0, lambda s=state: self.apply_report_banner(s))
@@ -4247,6 +4237,7 @@ class PrinterKioskApp:
             )
             return
 
+        self.remember_direct_result(state)
         self.apply_report_banner(state)
         self.set_refresh_button_text("새로고침")
 
@@ -4813,8 +4804,7 @@ class PrinterKioskApp:
         card = self.build_card()
         self.make_title(card, "서인천고등학교 공용 프린터 제어 시스템")
 
-        # 입력 영역과 학생증 예시 그림을 좌우로 나란히 놓는다.
-        # 세로로 쌓으면 화면이 길어져 아래가 잘릴 수 있다.
+        # 입력 영역을 한데 묶어 가운데에 둔다.
         row = ctk.CTkFrame(card, fg_color="transparent")
         row.pack(pady=(0, 4))
 
@@ -4850,39 +4840,11 @@ class PrinterKioskApp:
 
         self.primary_button(left, "확인", self.check_user, width=240, height=60, font_size=20).pack(pady=(0, 28))
 
-        self.build_card_guide(row, height=310, column=1)
-
         divider = ctk.CTkFrame(card, fg_color=COLOR_BORDER, height=1)
         divider.pack(fill="x", pady=(4, 24))
 
         self.body_label(card, "바코드 리더기로 학생증을 찍거나 학생증 코드를 직접 입력하세요.", size=16, muted=True).pack(pady=(0, 6))
         self.body_label(card, "한글 입력 상태여도 학생증 코드는 자동으로 영어 코드로 보정됩니다.", size=14, muted=True).pack()
-
-    def build_card_guide(self, parent, height=270, column=1):
-        """
-        학생증 예시 그림을 옆칸에 붙인다.
-
-        어느 부분을 리더기에 대야 하는지 글로만 설명하면 학생이 앞면을 대거나
-        엉뚱한 곳을 대는 일이 많아서, 실제 학생증 그림을 함께 보여준다.
-        그림 파일이 없으면 아무것도 그리지 않고 넘어간다.
-        """
-        image = load_card_guide_image(height)
-
-        if image is None:
-            return None
-
-        box = ctk.CTkFrame(parent, fg_color="transparent")
-        box.grid(row=0, column=column, padx=(34, 0), sticky="n")
-
-        ctk.CTkLabel(box, text="", image=image).pack()
-
-        self.body_label(
-            box,
-            "학생증 뒷면의 빨간 칸 안쪽\n바코드를 리더기에 대세요",
-            size=13, muted=True
-        ).pack(pady=(8, 0))
-
-        return box
 
     def build_corner_buttons(self):
         """
@@ -5294,8 +5256,6 @@ class PrinterKioskApp:
         entry.bind("<Return>", lambda e: confirm())
 
         self.primary_button(left, "확인", confirm, width=240, height=58, font_size=19).pack(pady=(0, 20))
-
-        self.build_card_guide(row, height=280, column=1)
 
         self.body_label(
             card,
