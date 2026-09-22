@@ -90,7 +90,7 @@ DB_NAME = "school_printer.db"
 # 프로그램이 스스로 업데이트를 확인하는 일은 없다.
 # 관리자가 버튼을 눌렀을 때만 확인한다.
 # -----------------------------
-APP_VERSION = "1.5.4"
+APP_VERSION = "1.5.5"
 GITHUB_REPO = "sicgaonnury/printer"
 DEFAULT_ADMIN_PASSWORD = "1234"
 
@@ -8893,33 +8893,46 @@ class PrinterKioskApp:
         right.grid(row=0, column=2, padx=(24, 0), sticky="n")
 
         # ── 왼쪽: 관리자 방식 ──
-        self.body_label(left, "관리자 방식", size=19, bold=True).pack(pady=(0, 10))
+        self.body_label(left, "관리자 방식", size=19, bold=True).pack(pady=(0, 12))
+
+        # 선택지와 설명을 한 상자에 담아 오른쪽 명단 표와 무게를 맞춘다
+        mode_box = ctk.CTkFrame(left, fg_color=COLOR_ENTRY_BG, corner_radius=14)
+        mode_box.pack(fill="x")
+
+        mode_inner = ctk.CTkFrame(mode_box, fg_color="transparent")
+        mode_inner.pack(padx=22, pady=(18, 16), fill="x")
 
         mode_var = tk.StringVar(value=get_admin_mode())
 
         for value, text in (("single", "단일 비밀번호 + 기록"), ("individual", "관리자별 비밀번호 + 개인별 기록")):
             ctk.CTkRadioButton(
-                left, text=text, variable=mode_var, value=value,
+                mode_inner, text=text, variable=mode_var, value=value,
                 font=(self.font_family, 15), text_color=COLOR_TEXT,
+                radiobutton_width=20, radiobutton_height=20, border_width_checked=6,
                 fg_color=COLOR_PRIMARY, hover_color=COLOR_PRIMARY_HOVER,
                 command=lambda: refresh_mode_hint()
-            ).pack(anchor="w", pady=4)
+            ).pack(anchor="w", pady=5)
 
-        mode_hint = self.body_label(left, "", size=13, muted=True, wraplength=330, justify="left")
-        mode_hint.pack(pady=(8, 12), anchor="w")
+        ctk.CTkFrame(mode_inner, fg_color=COLOR_BORDER, height=1).pack(fill="x", pady=(12, 10))
+
+        # 방식을 바꿔도 상자 높이가 출렁이지 않도록 설명 칸 높이를 고정한다 (4줄)
+        mode_hint = self.body_label(mode_inner, "", size=13, muted=True, wraplength=360, justify="left")
+        mode_hint.configure(anchor="nw", height=84)
+        mode_hint.pack(fill="x")
 
         def refresh_mode_hint():
             if mode_var.get() == "individual":
                 mode_hint.configure(text=(
-                    "관리자 명단(admin_list.csv)에 적힌 사람만 들어올 수 있습니다.\n"
-                    "각자 자기 비밀번호나 관리자코드(카드 QR)로 들어오고,\n"
+                    "관리자 명단에 적힌 사람만 들어올 수 있습니다.\n"
+                    "각자 비밀번호나 관리자코드(카드 QR)로 들어오고\n"
                     "기록에는 그 사람 이름으로 남습니다.\n"
                     "명단이 비어 있을 때만 메인 비밀번호가 통합니다."
                 ))
             else:
                 mode_hint.configure(text=(
-                    "메인 비밀번호 하나와 메인 관리자코드로 들어옵니다.\n"
-                    "작업은 모두 기록되지만 이름 대신 '관리자' 로 남습니다."
+                    "메인 비밀번호와 메인 관리자코드로 들어옵니다.\n"
+                    "작업은 모두 기록되지만 이름 대신\n"
+                    "'관리자' 로 남습니다."
                 ))
 
         refresh_mode_hint()
@@ -8947,7 +8960,7 @@ class PrinterKioskApp:
             )
             self.admin_account_screen()
 
-        self.primary_button(left, "방식 저장", save_mode, width=180, height=46).pack(anchor="w")
+        self.primary_button(left, "방식 저장", save_mode, width=160, height=44).pack(pady=(14, 0))
 
         # ── 오른쪽: 관리자 명단 ──
         self.body_label(right, "관리자 명단", size=19, bold=True).pack(pady=(0, 6))
@@ -8968,12 +8981,14 @@ class PrinterKioskApp:
         tree.heading("code", text="관리자코드")
         tree.heading("pw", text="비밀번호")
         tree.heading("note", text="비고")
-        tree.column("number", width=70, anchor="center", stretch=False)
-        tree.column("name", width=90, stretch=False)
-        tree.column("title", width=100, stretch=False)
-        tree.column("code", width=95, anchor="center", stretch=False)
-        tree.column("pw", width=85, anchor="center", stretch=False)
-        tree.column("note", width=120, stretch=False)
+        # 제목 글자가 커서 칸을 넉넉히 잡는다. (합계 900 — 위 설명 문장 폭과 같아서
+        # 표를 넓혀도 화면 전체 폭은 늘지 않는다)
+        tree.column("number", width=110, anchor="center", stretch=False)
+        tree.column("name", width=130, anchor="center", stretch=False)
+        tree.column("title", width=170, anchor="center", stretch=False)
+        tree.column("code", width=160, anchor="center", stretch=False)
+        tree.column("pw", width=140, anchor="center", stretch=False)
+        tree.column("note", width=190, stretch=False)
         tree.pack(pady=(0, 6))
 
         problem_label = self.body_label(right, "", size=13, wraplength=500, justify="left")
