@@ -521,6 +521,33 @@ def init_db():
     add_column_if_missing(cur, "print_logs", "sheet_count", "sheet_count INTEGER NOT NULL DEFAULT 1")
     add_column_if_missing(cur, "print_logs", "duplex", "duplex INTEGER NOT NULL DEFAULT 0")
 
+    # 관리자별 계정 (관리자 명단 CSV 에서 읽어 온다. 비밀번호와 코드는 해시로만 보관)
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS admins (
+        name TEXT PRIMARY KEY,
+        password_hash TEXT NOT NULL DEFAULT '',
+        code_hash TEXT NOT NULL DEFAULT '',
+        note TEXT NOT NULL DEFAULT '',
+        updated TEXT NOT NULL DEFAULT ''
+    )
+    """)
+
+    # 관리자 화면에 '학번 이름 (직함)' 으로 보여주기 위한 칸
+    add_column_if_missing(cur, "admins", "student_number", "student_number TEXT NOT NULL DEFAULT ''")
+    add_column_if_missing(cur, "admins", "title", "title TEXT NOT NULL DEFAULT ''")
+
+    # 관리자 작업 기록 (누가 · 언제 · 무엇을)
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS admin_logs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        log_date TEXT NOT NULL,
+        log_time TEXT NOT NULL,
+        actor TEXT NOT NULL,
+        action TEXT NOT NULL,
+        detail TEXT NOT NULL DEFAULT ''
+    )
+    """)
+
     cur.execute("""
     CREATE TABLE IF NOT EXISTS shutdown_schedules (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -536,6 +563,7 @@ def init_db():
         "daily_limit": "3",
         "max_files_per_job": "3",
         "admin_password": hash_password(DEFAULT_ADMIN_PASSWORD),
+        "admin_mode": "single",
         "idle_minutes": "5",
         "delete_mode": "print",
         "print_delete_minutes": "5",
@@ -563,6 +591,9 @@ def get_setting(name, default=""):
 
 
 def set_setting(name, value):
+    # 관리자가 설정을 바꾸면 무엇이 어떻게 바뀌었는지 기록한다
+    before = get_setting(name, None) if admin_session_active() else None
+
     conn = connect_db()
     cur = conn.cursor()
     cur.execute("""
@@ -572,6 +603,460 @@ def set_setting(name, value):
     """, (name, str(value)))
     conn.commit()
     conn.close()
+
+    if admin_session_active() and name in SETTING_LABELS and str(before) != str(value):
+        label = SETTING_LABELS[name]
+
+        if name in SECRET_SETTINGS:
+            admin_log("설정 변경", f"{label} 변경")
+        else:
+            old_text = "(없음)" if before in (None, "") else describe_setting(name, before)
+            admin_log("설정 변경", f"{label}: {old_text} → {describe_setting(name, value)}")
+
+
+# -----------------------------
+# 관리자 작업 기록
+#
+# 관리자 화면에 들어온 사람을 기억해 두고, 그 사이의 작업을 모두 남긴다.
+#   · 단일 방식 : 이름 대신 '관리자' 로 남는다
+#   · 개별 방식 : 관리자 명단의 이름으로 남는다
+# -----------------------------
+_admin_session = {"actor": None, "via": ""}
+
+SETTING_LABELS = {
+    "daily_limit": "하루 출력 횟수",
+    "daily_page_limit": "하루 용지 장수",
+    "limit_mode": "출력 제한 방식",
+    "max_files_per_job": "한 번에 고를 파일 수",
+    "max_copies": "파일당 최대 부수",
+    "selected_printer": "프린터",
+    "file_open_dir": "파일 선택 기본 폴더",
+    "download_dir": "받은 파일 저장 폴더",
+    "auto_delete_minutes": "받은 파일 보관 시간(분)",
+    "delete_mode": "출력 후 삭제 방식",
+    "print_delete_minutes": "출력 후 삭제 유예(분)",
+    "fullscreen": "전체화면",
+    "block_system_keys": "단축키 차단",
+    "admin_password": "메인 비밀번호",
+    "admin_barcode": "메인 관리자 코드",
+    "admin_mode": "관리자 방식",
+    "idle_minutes": "자리 비움 복귀(분)",
+}
+
+SECRET_SETTINGS = {"admin_password", "admin_barcode"}
+
+_SETTING_VALUE_NAMES = {
+    "limit_mode": {"count": "횟수", "pages": "용지 장수"},
+    "delete_mode": {"time": "지우지 않음", "print": "바로 지움", "print_delay": "유예 후 지움"},
+    "admin_mode": {"single": "단일 비밀번호", "individual": "관리자별 비밀번호"},
+    "fullscreen": {"0": "끔", "1": "켬"},
+    "block_system_keys": {"0": "끔", "1": "켬"},
+}
+
+
+def describe_setting(name, value):
+    """기록에 남길 때 알아보기 쉬운 말로 바꾼다."""
+    return _SETTING_VALUE_NAMES.get(name, {}).get(str(value), str(value))
+
+
+def admin_session_active():
+    return bool(_admin_session.get("actor"))
+
+
+def current_admin():
+    return _admin_session.get("actor") or ""
+
+
+def admin_log_as(actor, action, detail=""):
+    """누가 했는지 직접 정해서 기록한다. (로그인 실패처럼 아직 누구인지 모를 때)"""
+    now = datetime.now()
+
+    try:
+        conn = connect_db()
+        conn.execute(
+            "INSERT INTO admin_logs(log_date, log_time, actor, action, detail) VALUES (?, ?, ?, ?, ?)",
+            (now.strftime("%Y-%m-%d"), now.strftime("%H:%M:%S"), str(actor), str(action), str(detail))
+        )
+        conn.commit()
+        conn.close()
+    except Exception:
+        # 기록이 실패해도 본래 작업은 계속되어야 한다
+        pass
+
+
+def admin_log(action, detail=""):
+    """지금 관리자 화면에 들어와 있는 사람 이름으로 기록한다."""
+    if not admin_session_active():
+        return
+
+    admin_log_as(current_admin(), action, detail)
+
+
+def begin_admin_session(actor, via):
+    _admin_session["actor"] = actor
+    _admin_session["via"] = via
+
+    shown = describe_admin(actor)
+    admin_log("로그인", via + (f" · {shown}" if shown and shown != actor else ""))
+
+
+def end_admin_session(reason="나감"):
+    if not admin_session_active():
+        return
+
+    admin_log(reason)
+    _admin_session["actor"] = None
+    _admin_session["via"] = ""
+
+
+def fetch_admin_logs(actor=None, limit=500):
+    conn = connect_db()
+    cur = conn.cursor()
+
+    if actor:
+        cur.execute(
+            "SELECT log_date, log_time, actor, action, detail FROM admin_logs "
+            "WHERE actor=? ORDER BY id DESC LIMIT ?", (actor, limit)
+        )
+    else:
+        cur.execute(
+            "SELECT log_date, log_time, actor, action, detail FROM admin_logs "
+            "ORDER BY id DESC LIMIT ?", (limit,)
+        )
+
+    rows = cur.fetchall()
+    conn.close()
+    return rows
+
+
+def list_admin_log_actors():
+    conn = connect_db()
+    cur = conn.cursor()
+    cur.execute("SELECT DISTINCT actor FROM admin_logs ORDER BY actor")
+    rows = [r[0] for r in cur.fetchall()]
+    conn.close()
+    return rows
+
+
+def export_admin_logs_to_csv(path, actor=None):
+    rows = fetch_admin_logs(actor=actor, limit=1_000_000)
+
+    with open(path, "w", encoding="utf-8-sig", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["날짜", "시각", "관리자", "작업", "내용"])
+        for row in reversed(rows):
+            writer.writerow(row)
+
+    return len(rows)
+
+
+# -----------------------------
+# 관리자 명단 (관리자별 비밀번호 방식)
+#
+# 프로그램 폴더의 admin_list.csv 에 관리자를 적는다.
+#   이름 · 학번 · 직함 · 관리자코드 · 비밀번호 · 비고
+#   (학번 · 직함은 관리자 화면 위쪽에 '학번 이름 (직함)' 으로 표시된다. 비워도 된다)
+#
+# 비밀번호와 관리자코드는 파일에 오래 두면 안 되므로, 프로그램이 읽는 즉시
+# 해시로 바꿔 DB 에 보관하고 파일의 그 칸은 '(등록됨)' 으로 바꿔 쓴다.
+#   · 새로 정하거나 바꾸려면 → 그 칸에 새 값을 적고 저장
+#   · 그대로 두려면        → '(등록됨)' 그대로 둔다
+#   · 없애려면             → 칸을 비운다
+# 파일에서 줄을 지우면 그 관리자는 더 이상 들어올 수 없다.
+# -----------------------------
+ADMIN_CSV_NAME = "admin_list.csv"
+ADMIN_CSV_HEADER = ["이름", "학번", "직함", "관리자코드", "비밀번호", "비고"]
+REGISTERED_MARK = "(등록됨)"
+
+_admin_csv_state = {"stamp": None, "problems": []}
+
+
+def get_admin_mode():
+    mode = get_setting("admin_mode", "single")
+    return mode if mode in ("single", "individual") else "single"
+
+
+def get_admin_csv_path():
+    return os.path.join(get_program_dir(), ADMIN_CSV_NAME)
+
+
+def ensure_admin_csv():
+    """관리자 명단 파일이 없으면 제목 줄만 있는 파일을 만든다."""
+    path = get_admin_csv_path()
+
+    if os.path.exists(path):
+        return path
+
+    try:
+        with open(path, "w", encoding="utf-8-sig", newline="") as f:
+            csv.writer(f).writerow(ADMIN_CSV_HEADER)
+    except OSError:
+        pass
+
+    return path
+
+
+def list_admins():
+    conn = connect_db()
+    cur = conn.cursor()
+    cur.execute("SELECT name, password_hash, code_hash, note FROM admins ORDER BY name")
+    rows = cur.fetchall()
+    conn.close()
+    return rows
+
+
+def list_admin_profiles():
+    """{이름: (학번, 직함)}"""
+    conn = connect_db()
+    cur = conn.cursor()
+    cur.execute("SELECT name, student_number, title FROM admins")
+    rows = {name: (number or "", title or "") for name, number, title in cur.fetchall()}
+    conn.close()
+    return rows
+
+
+def describe_admin(name):
+    """
+    관리자를 '학번 이름 (직함)' 으로 나타낸다.
+    학번이나 직함이 비어 있으면 그 부분은 뺀다.
+    명단에 없는 이름(단일 방식의 '관리자' 등)은 그대로 돌려준다.
+    """
+    if not name:
+        return ""
+
+    number, title = list_admin_profiles().get(name, ("", ""))
+
+    text = f"{number} {name}".strip()
+
+    if title:
+        text += f" ({title})"
+
+    return text
+
+
+def find_admin_by_password(password):
+    if not password:
+        return None
+
+    for name, pw_hash, _, _ in list_admins():
+        if pw_hash and verify_password(password, pw_hash):
+            return name
+
+    return None
+
+
+def find_admin_by_code(code):
+    code = normalize_card_code(code)
+
+    if not code:
+        return None
+
+    for name, _, code_hash, _ in list_admins():
+        if code_hash and verify_password(code, code_hash):
+            return name
+
+    return None
+
+
+def _read_admin_csv_rows(path):
+    for enc in ("utf-8-sig", "cp949"):
+        try:
+            with open(path, "r", encoding=enc, newline="") as f:
+                return list(csv.reader(f))
+        except UnicodeDecodeError:
+            continue
+    raise ValueError("관리자 명단 파일의 글자 형식을 읽을 수 없습니다.")
+
+
+def sync_admin_csv(force=False):
+    """
+    관리자 명단 파일을 읽어 DB 에 반영한다.
+    파일이 바뀌지 않았으면 아무것도 하지 않는다. (3초마다 불려도 가볍다)
+    돌려주는 값은 반영 여부.
+    """
+    path = ensure_admin_csv()
+    stamp = _csv_stamp(path)
+
+    if not force and stamp is not None and stamp == _admin_csv_state["stamp"]:
+        return False
+
+    try:
+        rows = _read_admin_csv_rows(path)
+    except Exception as e:
+        _admin_csv_state["problems"] = [str(e)]
+        _admin_csv_state["stamp"] = stamp
+        return False
+
+    if not rows:
+        rows = [ADMIN_CSV_HEADER]
+
+    header = [h.strip() for h in rows[0]]
+
+    def col(label):
+        return header.index(label) if label in header else -1
+
+    i_name, i_code, i_pw, i_note = col("이름"), col("관리자코드"), col("비밀번호"), col("비고")
+    i_number, i_title = col("학번"), col("직함")
+
+    if i_name < 0:
+        _admin_csv_state["problems"] = ["첫 줄에 '이름' 칸이 없습니다. 제목 줄을 확인하세요."]
+        _admin_csv_state["stamp"] = stamp
+        return False
+
+    existing = {name: (pw, code, note) for name, pw, code, note in list_admins()}
+    old_profiles = list_admin_profiles()
+    profiles = {}
+    result = {}
+    problems = []
+    rewritten = [ADMIN_CSV_HEADER]
+    new_codes = {}
+    new_pws = {}
+
+    def cell(row, idx):
+        return row[idx].strip() if 0 <= idx < len(row) else ""
+
+    for row in rows[1:]:
+        name = cell(row, i_name)
+
+        if not name:
+            continue
+
+        if name in result:
+            problems.append(f"'{name}' 이(가) 두 번 적혀 있어 뒤의 줄은 무시했습니다.")
+            continue
+
+        old_pw, old_code, _ = existing.get(name, ("", "", ""))
+        pw_cell, code_cell = cell(row, i_pw), cell(row, i_code)
+        note = cell(row, i_note)
+        profiles[name] = (cell(row, i_number), cell(row, i_title))
+
+        # 비밀번호
+        if pw_cell == REGISTERED_MARK:
+            pw_hash = old_pw
+        elif pw_cell == "":
+            pw_hash = ""
+        else:
+            pw_hash = old_pw if (old_pw and verify_password(pw_cell, old_pw)) else hash_password(pw_cell)
+            new_pws[name] = pw_cell
+
+        # 관리자코드
+        if code_cell == REGISTERED_MARK:
+            code_hash = old_code
+        elif code_cell == "":
+            code_hash = ""
+        else:
+            plain = normalize_card_code(code_cell)
+
+            if get_student(plain):
+                problems.append(f"'{name}' 의 관리자코드가 학생증 코드·학번과 겹쳐 등록하지 않았습니다.")
+                code_hash = old_code
+            else:
+                code_hash = old_code if (old_code and verify_password(plain, old_code)) else hash_password(plain)
+                new_codes[name] = plain
+
+        result[name] = [pw_hash, code_hash, note]
+        rewritten.append([
+            name,
+            profiles[name][0],
+            profiles[name][1],
+            REGISTERED_MARK if code_hash else "",
+            REGISTERED_MARK if pw_hash else "",
+            note,
+        ])
+
+    # 같은 비밀번호 · 같은 코드를 두 사람이 쓰면 누구인지 가릴 수 없다.
+    # 새로 적은 값이 다른 사람의 값과 같으면 새로 적은 쪽을 받지 않는다.
+    # 둘 다 이번에 새로 적었으면 파일에서 먼저 나온 사람을 살린다.
+    order = list(result.keys())
+
+    def dedupe(plain_map, index, label):
+        for pos, name in enumerate(order):
+            if name not in plain_map:
+                continue
+
+            plain = plain_map[name]
+
+            for other in order:
+                if other == name:
+                    continue
+
+                other_hash = result[other][index]
+
+                if not other_hash:
+                    continue
+
+                # 뒤에 나온 사람이 이번에 새로 적은 값이면, 그쪽이 양보한다
+                if other in plain_map and order.index(other) > pos:
+                    continue
+
+                if verify_password(plain, other_hash):
+                    result[name][index] = existing.get(name, ("", "", ""))[index]
+                    problems.append(f"'{name}' 의 {label}이(가) '{other}' 와 같아 등록하지 않았습니다.")
+                    break
+
+    dedupe(new_pws, 0, "비밀번호")
+    dedupe(new_codes, 1, "관리자코드")
+
+    # 반영 (명단에서 빠진 관리자는 지운다 → 더 이상 들어올 수 없다)
+    changes = []
+    conn = connect_db()
+    cur = conn.cursor()
+    today = str(date.today())
+
+    for name, (pw_hash, code_hash, note) in result.items():
+        old = existing.get(name)
+        if old is None:
+            changes.append(f"추가: {name}")
+        else:
+            number, title = profiles.get(name, ("", ""))
+            old_number, old_title = old_profiles.get(name, ("", ""))
+            parts = []
+            if old[0] != pw_hash: parts.append("비밀번호")
+            if old[1] != code_hash: parts.append("관리자코드")
+            if old_number != number: parts.append("학번")
+            if old_title != title: parts.append("직함")
+            if old[2] != note: parts.append("비고")
+            if parts:
+                changes.append(f"변경: {name} ({', '.join(parts)})")
+
+        number, title = profiles.get(name, ("", ""))
+
+        cur.execute("""
+        INSERT INTO admins(name, password_hash, code_hash, note, updated, student_number, title)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(name) DO UPDATE SET password_hash=excluded.password_hash,
+            code_hash=excluded.code_hash, note=excluded.note, updated=excluded.updated,
+            student_number=excluded.student_number, title=excluded.title
+        """, (name, pw_hash, code_hash, note, today, number, title))
+
+    for name in existing:
+        if name not in result:
+            cur.execute("DELETE FROM admins WHERE name=?", (name,))
+            changes.append(f"삭제: {name}")
+
+    conn.commit()
+    conn.close()
+
+    # 파일의 비밀번호 · 코드 칸을 '(등록됨)' 으로 바꿔 쓴다 (평문이 파일에 남지 않도록)
+    for r in rewritten[1:]:
+        name = r[0]
+        r[3] = REGISTERED_MARK if result[name][1] else ""
+        r[4] = REGISTERED_MARK if result[name][0] else ""
+
+    try:
+        with open(path, "w", encoding="utf-8-sig", newline="") as f:
+            csv.writer(f).writerows(rewritten)
+    except OSError:
+        problems.append("명단 파일이 다른 프로그램(엑셀 등)에서 열려 있어 비밀번호 칸을 가리지 못했습니다. 파일을 닫아 주세요.")
+
+    _admin_csv_state["stamp"] = _csv_stamp(path)
+    _admin_csv_state["problems"] = problems
+
+    if changes:
+        actor = current_admin() or "(명단 파일)"
+        admin_log_as(actor, "관리자 명단 반영", " / ".join(changes))
+
+    return True
 
 
 # 제한값이 0 이면 "제한 없음"을 뜻한다.
@@ -4414,6 +4899,7 @@ class PrinterKioskApp:
 
                     if idle > minutes * 60:
                         self._last_activity = time.time()
+                        end_admin_session("자리 비움으로 자동 종료")
                         self.start_screen()
             except Exception:
                 pass
@@ -4686,8 +5172,44 @@ class PrinterKioskApp:
         content.pack(padx=56, pady=44)
 
         self.build_corner_buttons()
+        self.build_admin_badge()
 
         return content
+
+    def build_admin_badge(self):
+        """
+        관리자 화면이면 왼쪽 위에 누구로 들어왔는지 띄운다. ('학번 이름 (직함)')
+        화면마다 높이가 달라 카드 안에 넣으면 아래가 잘릴 수 있으므로,
+        오른쪽 아래 버튼처럼 배경 위에 따로 얹는다.
+        """
+        if not admin_session_active():
+            return
+
+        shown = describe_admin(current_admin()) or current_admin()
+
+        badge = ctk.CTkFrame(
+            self.outer,
+            fg_color=COLOR_PRIMARY_SOFT,
+            corner_radius=12
+        )
+        badge.place(relx=0.0, rely=0.0, x=28, y=10, anchor="nw")
+
+        ctk.CTkLabel(
+            badge,
+            text="관리자",
+            font=(self.font_family, 13, "bold"),
+            text_color="#FFFFFF",
+            fg_color=COLOR_PRIMARY,
+            corner_radius=8,
+            width=58, height=26
+        ).pack(side="left", padx=(6, 8), pady=5)
+
+        ctk.CTkLabel(
+            badge,
+            text=shown,
+            font=(self.font_family, 15, "bold"),
+            text_color=COLOR_PRIMARY
+        ).pack(side="left", padx=(0, 14), pady=5)
 
     def make_title(self, parent, text, subtitle=None):
         title_frame = ctk.CTkFrame(parent, fg_color="transparent")
@@ -4791,6 +5313,7 @@ class PrinterKioskApp:
         )
 
         if result:
+            end_admin_session("프로그램 종료")
             self.root.destroy()
 
     # -----------------------------
@@ -4800,6 +5323,9 @@ class PrinterKioskApp:
         # 처음 화면으로 돌아오면 인증 상태를 지운다
         # (다음 학생이 앞 사람 이름으로 파일을 보내면 안 된다)
         self._current_user = None
+
+        # 관리자 화면에서 나온 것이면 기록을 남기고 세션을 닫는다
+        end_admin_session("나감")
 
         card = self.build_card()
         self.make_title(card, "서인천고등학교 공용 프린터 제어 시스템")
@@ -4831,6 +5357,11 @@ class PrinterKioskApp:
         self.card_entry = self.make_entry(left, width=460, height=60, font_size=28)
         self.card_entry.pack(pady=(0, 24))
         self.card_entry.bind("<Return>", lambda event: self.check_user())
+
+        # 학생증 코드(5자리)보다 길게 입력되면 관리자코드일 수 있으므로 가린다.
+        # 옆에서 보고 따라 적는 일을 막기 위해서다.
+        self._scan_masked = False
+        self.card_entry.bind("<KeyRelease>", lambda event: self.update_scan_mask(), add="+")
 
         # 학생이 입력창을 클릭하지 않아도 바코드가 바로 입력되도록
         # 이 화면에서는 항상 입력창에 포커스를 유지한다
@@ -4898,7 +5429,25 @@ class PrinterKioskApp:
         else:
             write_sync_csv()
 
+        # 관리자 명단도 처음 한 번 읽어 둔다
+        try:
+            sync_admin_csv(force=True)
+        except Exception:
+            pass
+
         def tick():
+            # 관리자 명단 파일이 바뀌었으면 반영한다 (비밀번호 칸은 곧바로 가려진다)
+            try:
+                if sync_admin_csv():
+                    refresh_admins = getattr(self, "_admin_list_refresh", None)
+                    if refresh_admins is not None:
+                        try:
+                            refresh_admins()
+                        except Exception:
+                            self._admin_list_refresh = None
+            except Exception:
+                pass
+
             try:
                 if sync_csv_changed_outside():
                     try:
@@ -5611,6 +6160,29 @@ class PrinterKioskApp:
         self.root.lift()
         self.root.focus_force()
 
+    # 이 글자 수를 넘으면 첫 화면 입력을 * 로 가린다 (학생증 코드는 5자리)
+    SCAN_MASK_AFTER = 5
+
+    def update_scan_mask(self):
+        """입력 길이에 따라 첫 화면 입력칸을 가리거나 다시 보이게 한다."""
+        entry = getattr(self, "card_entry", None)
+
+        if entry is None:
+            return
+
+        try:
+            if not entry.winfo_exists():
+                return
+
+            hide = len(entry.get()) > self.SCAN_MASK_AFTER
+
+            # 같은 상태로 계속 다시 설정하지 않도록 지금 상태를 기억해 둔다
+            if getattr(self, "_scan_masked", False) != hide:
+                entry.configure(show="*" if hide else "")
+                self._scan_masked = hide
+        except Exception:
+            pass
+
     def reset_scan_entry(self):
         """입력창을 비우고 다시 포커스를 준다 (다음 스캔 대기 상태)."""
         if self.card_entry is None or not self.card_entry.winfo_exists():
@@ -5621,6 +6193,7 @@ class PrinterKioskApp:
         except Exception:
             pass
 
+        self.update_scan_mask()
         self.focus_scan_entry()
 
     def check_user(self):
@@ -5631,10 +6204,11 @@ class PrinterKioskApp:
             messagebox.showwarning("입력 오류", "학생증 코드를 입력하세요.")
             return
 
-        # 관리자 바코드 코드 감지 (이스터에그)
-        admin_code = get_setting("admin_barcode", "")
-        if admin_code and normalize_card_code(admin_code) == card_code:
+        # 관리자코드 감지 (관리자 카드의 QR 을 찍은 경우)
+        admin_name = self.match_admin_code(card_code)
+        if admin_name:
             self.reset_scan_entry()
+            begin_admin_session(admin_name, "관리자코드")
             self.admin_menu()
             return
 
@@ -6784,11 +7358,76 @@ class PrinterKioskApp:
     # -----------------------------
     # 관리자 화면
     # -----------------------------
+    def match_admin_code(self, card_code):
+        """
+        첫 화면에 입력된 값이 관리자코드인지 확인하고, 맞으면 기록에 남길 이름을 돌려준다.
+
+        단일 방식  : 메인 관리자 코드와 비교 → '관리자'
+        개별 방식  : 관리자 명단에서 찾음   → 그 사람 이름
+                     (명단이 비어 있으면 잠기지 않도록 메인 코드를 받아 준다)
+        """
+        main_code = normalize_card_code(get_setting("admin_barcode", ""))
+
+        if get_admin_mode() == "individual":
+            name = find_admin_by_code(card_code)
+            if name:
+                return name
+
+            if not list_admins() and main_code and main_code == card_code:
+                return "관리자(메인 코드)"
+
+            return None
+
+        if main_code and main_code == card_code:
+            return "관리자"
+
+        return None
+
+    def match_admin_password(self, password):
+        """
+        비밀번호가 누구의 것인지 확인한다. 돌려주는 값은 (이름, 들어온 방법).
+        맞는 사람이 없으면 (None, "").
+        """
+        if not password:
+            return None, ""
+
+        real_password = get_setting("admin_password", DEFAULT_ADMIN_PASSWORD)
+
+        def main_ok():
+            if not verify_password(password, real_password):
+                return False
+            # 예전 버전에서 평문으로 저장된 비밀번호는 이때 해시로 바꿔 둔다
+            if is_legacy_password(real_password):
+                set_setting("admin_password", hash_password(password))
+            return True
+
+        if get_admin_mode() == "individual":
+            name = find_admin_by_password(password)
+            if name:
+                return name, "관리자 비밀번호"
+
+            # 명단이 비어 있거나 읽지 못하면 아무도 못 들어오게 되므로,
+            # 그때만 메인 비밀번호를 받아 준다.
+            if not list_admins() and main_ok():
+                return "관리자(메인 비밀번호)", "메인 비밀번호 · 명단 없음"
+
+            return None, ""
+
+        if main_ok():
+            return "관리자", "비밀번호"
+
+        return None, ""
+
     def admin_login_screen(self):
         card = self.build_card()
         self.make_title(card, "관리자 로그인")
 
-        self.body_label(card, "관리자 비밀번호 입력", size=15).pack(pady=(0, 14))
+        if get_admin_mode() == "individual" and list_admins():
+            prompt = "본인의 관리자 비밀번호를 입력하세요"
+        else:
+            prompt = "관리자 비밀번호 입력"
+
+        self.body_label(card, prompt, size=15).pack(pady=(0, 14))
 
         password_entry = self.make_entry(card, width=280, height=48, font_size=16, show="*")
         password_entry.pack(pady=(0, 24))
@@ -6796,16 +7435,15 @@ class PrinterKioskApp:
 
         def check_password():
             password = password_entry.get()
-            real_password = get_setting("admin_password", DEFAULT_ADMIN_PASSWORD)
+            who, via = self.match_admin_password(password)
 
-            if verify_password(password, real_password):
-                # 예전 버전에서 평문으로 저장된 비밀번호는 이때 해시로 바꿔 둔다
-                if is_legacy_password(real_password):
-                    set_setting("admin_password", hash_password(password))
-
+            if who:
+                begin_admin_session(who, via)
                 self.admin_menu()
             else:
+                admin_log_as("-", "로그인 실패", "비밀번호가 틀림")
                 messagebox.showerror("접근 거부", "관리자 비밀번호가 틀렸습니다.")
+                password_entry.delete(0, tk.END)
 
         password_entry.bind("<Return>", lambda event: check_password())
 
@@ -6813,8 +7451,18 @@ class PrinterKioskApp:
         self.link_button(card, "처음 화면으로", self.start_screen, width=180, height=42).pack()
 
     def admin_menu(self):
+        # 로그인하지 않고 관리자 화면에 들어오는 길은 막는다
+        if not admin_session_active():
+            self.admin_login_screen()
+            return
+
         card = self.build_card()
         self.make_title(card, "관리자 모드")
+
+        self.body_label(
+            card, f"{describe_admin(current_admin()) or current_admin()} 님으로 들어왔습니다 · 이 화면에서 한 작업은 모두 기록됩니다",
+            size=13, muted=True
+        ).pack(pady=(0, 14))
 
         buttons = [
             ("이용자 관리", self.user_manage_screen),
@@ -6833,6 +7481,12 @@ class PrinterKioskApp:
             self.secondary_button(
                 grid_frame, text, cmd, width=340, height=64, font_size=18
             ).grid(row=row, column=col, padx=10, pady=10)
+
+        # 관리자 방식 · 명단 · 작업 기록 (두 칸을 합친 넓은 버튼)
+        self.secondary_button(
+            grid_frame, "관리자 계정 · 작업 기록", self.admin_account_screen,
+            width=700, height=56, font_size=17
+        ).grid(row=len(buttons) // 2, column=0, columnspan=2, padx=10, pady=(6, 10))
 
         bottom_frame = ctk.CTkFrame(card, fg_color="transparent")
         bottom_frame.pack()
@@ -6994,6 +7648,11 @@ class PrinterKioskApp:
 
                 write_sync_csv()
 
+                admin_log(
+                    "이용자 수정" if existing else "이용자 추가",
+                    f"{student_number} {name}({card_code})" + (" · 무제한" if unlimited else "")
+                )
+
                 messagebox.showinfo("완료", "이용자 정보를 저장했습니다.")
                 card_entry.delete(0, tk.END)
                 number_entry.delete(0, tk.END)
@@ -7022,6 +7681,7 @@ class PrinterKioskApp:
                 messagebox.showerror("오류", "해당 학생증 코드의 사용자가 없습니다.")
             else:
                 write_sync_csv()
+                admin_log("이용자 상태 변경", f"{card_code} → {'사용 가능' if value else '사용 중지'}")
                 messagebox.showinfo("완료", "상태를 변경했습니다.")
                 refresh_users()
 
@@ -7070,6 +7730,7 @@ class PrinterKioskApp:
             name_entry.delete(0, tk.END)
             unlimited_var.set(0)
 
+            admin_log("이용자 삭제", f"{name}({card_code})")
             messagebox.showinfo("완료", f"{name} ({card_code}) 님을 명단에서 지웠습니다.")
             refresh_users()
 
@@ -7100,6 +7761,7 @@ class PrinterKioskApp:
 
             try:
                 imported, skipped = import_users_from_file(path)
+                admin_log("이용자 명단 불러오기", f"{os.path.basename(path)} · {imported}명 반영, {skipped}줄 건너뜀")
                 messagebox.showinfo(
                     "불러오기 완료",
                     f"불러온 이용자: {imported}명\n건너뛴 행: {skipped}개"
@@ -7122,6 +7784,7 @@ class PrinterKioskApp:
 
             try:
                 export_users_to_csv(path)
+                admin_log("이용자 명단 내보내기", os.path.basename(path))
                 messagebox.showinfo("내보내기 완료", "이용자 명단을 CSV로 저장했습니다.")
             except Exception as e:
                 messagebox.showerror("내보내기 오류", str(e))
@@ -7702,6 +8365,7 @@ class PrinterKioskApp:
 
             try:
                 print_document(file_path, selected)
+                admin_log("테스트 출력", f"{os.path.basename(file_path)} → {selected}")
                 messagebox.showinfo("전송 완료", "테스트 출력 명령을 보냈습니다.")
             except Exception as e:
                 messagebox.showerror("오류", str(e))
@@ -7876,6 +8540,7 @@ class PrinterKioskApp:
                 if count == 0:
                     messagebox.showinfo("완료", "조건에 맞는 기록이 없어 빈 파일이 저장되었습니다.")
                 else:
+                    admin_log("출력 기록 내보내기", f"{count}건")
                     messagebox.showinfo("완료", f"출력 기록 {count}건을 저장했습니다.")
 
             except Exception as e:
@@ -7907,6 +8572,7 @@ class PrinterKioskApp:
                 if count == 0:
                     messagebox.showinfo("완료", "조건에 맞는 기록이 없어 빈 파일이 저장되었습니다.")
                 else:
+                    admin_log("사용자별 집계 내보내기", f"{count}명")
                     messagebox.showinfo("완료", f"사용자 {count}명의 집계를 저장했습니다.")
 
             except Exception as e:
@@ -8098,6 +8764,7 @@ class PrinterKioskApp:
         conn.close()
 
         self.clear_log_tree()
+        admin_log("출력 기록 전체 삭제")
         messagebox.showinfo("완료", "전체 출력 기록을 초기화했습니다.")
 
     def change_admin_password_screen(self):
@@ -8199,6 +8866,249 @@ class PrinterKioskApp:
 
         self.primary_button(card, "코드 저장", save_barcode, width=220, height=48).pack(pady=(0, 12))
         self.link_button(card, "관리자 메뉴로", self.admin_menu).pack()
+
+    def admin_account_screen(self):
+        """
+        관리자 방식 선택 · 관리자 명단 · 작업 기록으로 가는 화면.
+
+        단일 방식  : 메인 비밀번호 하나로 들어오고, 기록에는 '관리자' 로 남는다.
+        개별 방식  : admin_list.csv 에 적힌 사람마다 비밀번호와 관리자코드를 따로 두고,
+                     기록에는 그 사람 이름으로 남는다.
+        """
+        card = self.build_card()
+        self.make_title(card, "관리자 계정 · 작업 기록")
+
+        # 이 화면을 벗어나면 명단 자동 새로고침을 끊는다
+        self._admin_list_refresh = None
+
+        columns = ctk.CTkFrame(card, fg_color="transparent")
+        columns.pack(pady=(0, 10))
+
+        left = ctk.CTkFrame(columns, fg_color="transparent")
+        left.grid(row=0, column=0, padx=(0, 24), sticky="n")
+
+        ctk.CTkFrame(columns, fg_color=COLOR_BORDER, width=1).grid(row=0, column=1, sticky="ns")
+
+        right = ctk.CTkFrame(columns, fg_color="transparent")
+        right.grid(row=0, column=2, padx=(24, 0), sticky="n")
+
+        # ── 왼쪽: 관리자 방식 ──
+        self.body_label(left, "관리자 방식", size=19, bold=True).pack(pady=(0, 10))
+
+        mode_var = tk.StringVar(value=get_admin_mode())
+
+        for value, text in (("single", "단일 비밀번호 + 기록"), ("individual", "관리자별 비밀번호 + 개인별 기록")):
+            ctk.CTkRadioButton(
+                left, text=text, variable=mode_var, value=value,
+                font=(self.font_family, 15), text_color=COLOR_TEXT,
+                fg_color=COLOR_PRIMARY, hover_color=COLOR_PRIMARY_HOVER,
+                command=lambda: refresh_mode_hint()
+            ).pack(anchor="w", pady=4)
+
+        mode_hint = self.body_label(left, "", size=13, muted=True, wraplength=330, justify="left")
+        mode_hint.pack(pady=(8, 12), anchor="w")
+
+        def refresh_mode_hint():
+            if mode_var.get() == "individual":
+                mode_hint.configure(text=(
+                    "관리자 명단(admin_list.csv)에 적힌 사람만 들어올 수 있습니다.\n"
+                    "각자 자기 비밀번호나 관리자코드(카드 QR)로 들어오고,\n"
+                    "기록에는 그 사람 이름으로 남습니다.\n"
+                    "명단이 비어 있을 때만 메인 비밀번호가 통합니다."
+                ))
+            else:
+                mode_hint.configure(text=(
+                    "메인 비밀번호 하나와 메인 관리자코드로 들어옵니다.\n"
+                    "작업은 모두 기록되지만 이름 대신 '관리자' 로 남습니다."
+                ))
+
+        refresh_mode_hint()
+
+        def save_mode():
+            mode = mode_var.get()
+
+            if mode == "individual":
+                sync_admin_csv(force=True)
+
+                if not list_admins():
+                    if not messagebox.askyesno(
+                        "확인",
+                        "관리자 명단이 비어 있습니다.\n\n"
+                        "명단을 채우기 전까지는 메인 비밀번호로만 들어올 수 있습니다.\n"
+                        "그래도 관리자별 방식으로 바꿀까요?"
+                    ):
+                        return
+
+            set_setting("admin_mode", mode)
+            messagebox.showinfo(
+                "완료",
+                "관리자 방식을 바꿨습니다.\n\n" +
+                ("관리자별 비밀번호 + 개인별 기록" if mode == "individual" else "단일 비밀번호 + 기록")
+            )
+            self.admin_account_screen()
+
+        self.primary_button(left, "방식 저장", save_mode, width=180, height=46).pack(anchor="w")
+
+        # ── 오른쪽: 관리자 명단 ──
+        self.body_label(right, "관리자 명단", size=19, bold=True).pack(pady=(0, 6))
+        self.body_label(
+            right,
+            f"프로그램 폴더의 {ADMIN_CSV_NAME} 에 이름 · 학번 · 직함 · 관리자코드 · 비밀번호를 적고 저장하면\n"
+            "몇 초 안에 반영됩니다. 적은 비밀번호와 코드는 곧바로 '(등록됨)' 으로 가려집니다.",
+            size=13, muted=True
+        ).pack(pady=(0, 8))
+
+        tree = ttk.Treeview(
+            right, columns=("number", "name", "title", "code", "pw", "note"),
+            show="headings", height=6, style="App.Treeview"
+        )
+        tree.heading("number", text="학번")
+        tree.heading("name", text="이름")
+        tree.heading("title", text="직함")
+        tree.heading("code", text="관리자코드")
+        tree.heading("pw", text="비밀번호")
+        tree.heading("note", text="비고")
+        tree.column("number", width=70, anchor="center", stretch=False)
+        tree.column("name", width=90, stretch=False)
+        tree.column("title", width=100, stretch=False)
+        tree.column("code", width=95, anchor="center", stretch=False)
+        tree.column("pw", width=85, anchor="center", stretch=False)
+        tree.column("note", width=120, stretch=False)
+        tree.pack(pady=(0, 6))
+
+        problem_label = self.body_label(right, "", size=13, wraplength=500, justify="left")
+        problem_label.configure(text_color=COLOR_DANGER)
+        problem_label.pack(pady=(0, 6))
+
+        def refresh_admins():
+            for row in tree.get_children():
+                tree.delete(row)
+
+            profiles = list_admin_profiles()
+
+            for name, pw_hash, code_hash, note in list_admins():
+                number, title = profiles.get(name, ("", ""))
+                tree.insert("", "end", values=(
+                    number,
+                    name,
+                    title,
+                    "등록됨" if code_hash else "-",
+                    "등록됨" if pw_hash else "-",
+                    note
+                ))
+
+            problems = _admin_csv_state.get("problems") or []
+            problem_label.configure(text="\n".join("· " + p for p in problems[:4]))
+
+        self._admin_list_refresh = refresh_admins
+        refresh_admins()
+
+        def open_admin_csv():
+            path = ensure_admin_csv()
+            try:
+                os.startfile(path)
+            except Exception:
+                messagebox.showinfo("안내", f"명단 파일 위치\n\n{path}")
+
+        def reload_admin_csv():
+            sync_admin_csv(force=True)
+            refresh_admins()
+
+        list_buttons = ctk.CTkFrame(right, fg_color="transparent")
+        list_buttons.pack()
+        self.secondary_button(list_buttons, "명단 파일 열기", open_admin_csv, width=160, height=44).grid(row=0, column=0, padx=5)
+        self.secondary_button(list_buttons, "다시 읽기", reload_admin_csv, width=120, height=44).grid(row=0, column=1, padx=5)
+
+        # ── 아래: 작업 기록 ──
+        bottom = ctk.CTkFrame(card, fg_color="transparent")
+        bottom.pack(pady=(14, 0))
+
+        def leave(target):
+            self._admin_list_refresh = None
+            target()
+
+        self.primary_button(bottom, "작업 기록 보기", lambda: leave(self.admin_log_screen), width=200, height=48).grid(row=0, column=0, padx=8)
+        self.link_button(bottom, "관리자 메뉴로", lambda: leave(self.admin_menu), width=180).grid(row=0, column=1, padx=8)
+
+    def admin_log_screen(self):
+        """누가 · 언제 · 무엇을 했는지 보는 화면."""
+        card = self.build_card()
+        self.make_title(card, "관리자 작업 기록")
+
+        filter_frame = ctk.CTkFrame(card, fg_color="transparent")
+        filter_frame.pack(pady=(0, 10))
+
+        self.body_label(filter_frame, "관리자", size=16, bold=True).grid(row=0, column=0, padx=(0, 10))
+
+        actors = ["전체"] + list_admin_log_actors()
+        actor_var = tk.StringVar(value="전체")
+
+        ctk.CTkOptionMenu(
+            filter_frame, values=actors, variable=actor_var,
+            width=220, height=40, font=(self.font_family, 15),
+            fg_color=COLOR_SECONDARY_BG, button_color=COLOR_PRIMARY,
+            button_hover_color=COLOR_PRIMARY_HOVER, text_color=COLOR_TEXT,
+            command=lambda _: refresh()
+        ).grid(row=0, column=1)
+
+        tree = ttk.Treeview(
+            card, columns=("date", "time", "actor", "action", "detail"),
+            show="headings", height=14, style="App.Treeview"
+        )
+        tree.heading("date", text="날짜")
+        tree.heading("time", text="시각")
+        tree.heading("actor", text="관리자")
+        tree.heading("action", text="작업")
+        tree.heading("detail", text="내용")
+        tree.column("date", width=110, anchor="center", stretch=False)
+        tree.column("time", width=90, anchor="center", stretch=False)
+        tree.column("actor", width=150, stretch=False)
+        tree.column("action", width=170, stretch=False)
+        tree.column("detail", width=440, stretch=False)
+        tree.pack(pady=(0, 6))
+
+        count_label = self.body_label(card, "", size=13, muted=True)
+        count_label.pack(pady=(0, 10))
+
+        def selected_actor():
+            value = actor_var.get()
+            return None if value == "전체" else value
+
+        def refresh():
+            for row in tree.get_children():
+                tree.delete(row)
+
+            rows = fetch_admin_logs(actor=selected_actor(), limit=500)
+            for row in rows:
+                tree.insert("", "end", values=row)
+
+            count_label.configure(text=f"최근 {len(rows)}건 표시 (전체는 CSV 로 내보내기)")
+
+        refresh()
+
+        def export():
+            path = filedialog.asksaveasfilename(
+                title="관리자 작업 기록 내보내기",
+                defaultextension=".csv",
+                initialfile=f"관리자기록_{date.today()}.csv",
+                filetypes=[("CSV 파일", "*.csv")]
+            )
+
+            if not path:
+                return
+
+            try:
+                count = export_admin_logs_to_csv(path, actor=selected_actor())
+                admin_log("작업 기록 내보내기", f"{count}건 · {selected_actor() or '전체'}")
+                messagebox.showinfo("완료", f"기록 {count}건을 저장했습니다.")
+                refresh()
+            except Exception as e:
+                messagebox.showerror("내보내기 오류", str(e))
+
+        buttons = ctk.CTkFrame(card, fg_color="transparent")
+        buttons.pack()
+        self.primary_button(buttons, "CSV 내보내기", export, width=180, height=46).grid(row=0, column=0, padx=8)
+        self.link_button(buttons, "뒤로", self.admin_account_screen, width=140).grid(row=0, column=1, padx=8)
 
     def shutdown_schedule_screen(self):
         card = self.build_card()
@@ -8405,6 +9315,7 @@ class PrinterKioskApp:
                 ok, output = add_shutdown_schedule("once", None, str(target), run_time)
 
             if ok:
+                admin_log("자동 종료 일정 추가", label.replace("\n", " "))
                 messagebox.showinfo("완료", f"일정을 추가했습니다.\n\n{label}")
                 refresh_list()
             else:
@@ -8433,6 +9344,7 @@ class PrinterKioskApp:
             ok, output = delete_shutdown_schedule(schedule_id)
 
             if ok:
+                admin_log("자동 종료 일정 삭제", f"{schedule_id}번")
                 messagebox.showinfo("완료", "일정을 삭제했습니다.")
             else:
                 messagebox.showwarning(
@@ -8452,6 +9364,7 @@ class PrinterKioskApp:
                 return
 
             delete_all_shutdown_schedules()
+            admin_log("자동 종료 일정 전체 삭제")
             messagebox.showinfo("완료", "모든 일정을 삭제했습니다.")
             refresh_list()
 
@@ -8577,6 +9490,7 @@ class PrinterKioskApp:
                 return
 
             try:
+                admin_log("프로그램 업데이트", f"v{APP_VERSION} → v{info.get('version', '?')}")
                 apply_update(path)
             except Exception as e:
                 self.root.after(0, lambda: fail(str(e)))
@@ -8696,6 +9610,8 @@ class PrinterKioskApp:
 
             done, failed = set_windows_lockdown(enabled)
 
+            admin_log(f"Windows 잠금 {action}", ", ".join(done) + (f" / 실패: {', '.join(failed)}" if failed else ""))
+
             message = f"잠금 {action} 결과\n\n"
             if done:
                 message += "성공: " + ", ".join(done) + "\n"
@@ -8748,6 +9664,7 @@ class PrinterKioskApp:
             if error:
                 messagebox.showerror("실패", error)
             else:
+                admin_log("방화벽 설정", f"{FILE_SHARE_PORT}번 포트 {'허용' if allow else '차단'}")
                 messagebox.showinfo(
                     "완료",
                     f"방화벽 설정을 변경했습니다.\n\n"
