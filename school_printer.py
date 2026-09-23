@@ -83,14 +83,14 @@ DB_NAME = "school_printer.db"
 #   1. 아래 APP_VERSION 을 올린다      (예: 1.0.0 → 1.1.0)
 #   2. exe 를 새로 빌드한다
 #   3. GitHub 저장소 > Releases > 새 릴리스 작성
-#        · 태그 이름 : v1.6.0        (앞의 v 를 반드시 포함)
+#        · 태그 이름 : v1.6.2        (앞의 v 를 반드시 포함)
 #        · 빌드한 exe 파일을 첨부
 #   4. 키오스크에서 관리자 모드 > 보호 기능 설정 > 업데이트 확인
 #
 # 프로그램이 스스로 업데이트를 확인하는 일은 없다.
 # 관리자가 버튼을 눌렀을 때만 확인한다.
 # -----------------------------
-APP_VERSION = "1.6.1"
+APP_VERSION = "1.6.2"
 GITHUB_REPO = "sicgaonnury/printer"
 DEFAULT_ADMIN_PASSWORD = "1234"
 
@@ -6634,11 +6634,18 @@ class PrinterKioskApp:
         self.primary_button(buttons, "확인", confirm, width=160, height=52).grid(row=0, column=0, padx=8)
         self.secondary_button(buttons, "이 파일 빼기", cancel, width=160, height=52).grid(row=0, column=1, padx=8)
 
+        # 화면 정중앙에 띄운다.
+        # winfo_width 는 아직 1 로 나올 수 있으므로 실제로 필요한 크기를 쓴다.
         dialog.update_idletasks()
-        w, h = dialog.winfo_width(), dialog.winfo_height()
-        x = self.root.winfo_rootx() + (self.root.winfo_width() - w) // 2
-        y = self.root.winfo_rooty() + (self.root.winfo_height() - h) // 3
-        dialog.geometry(f"+{max(0, x)}+{max(0, y)}")
+        w = max(dialog.winfo_reqwidth(), dialog.winfo_width())
+        h = max(dialog.winfo_reqheight(), dialog.winfo_height())
+
+        screen_w = self.root.winfo_screenwidth()
+        screen_h = self.root.winfo_screenheight()
+        x = max(0, (screen_w - w) // 2)
+        y = max(0, (screen_h - h) // 2)
+
+        dialog.geometry(f"{w}x{h}+{x}+{y}")
 
         dialog.attributes("-topmost", True)
         dialog.grab_set()
@@ -6939,11 +6946,12 @@ class PrinterKioskApp:
             tree.heading("pages", text="페이지 수")
             tree.heading("copies", text="부수")
 
-            tree.column("no", width=50, anchor="center")
-            tree.column("file_name", width=400)
-            tree.column("file_type", width=80, anchor="center")
-            tree.column("pages", width=130, anchor="center")
-            tree.column("copies", width=100, anchor="center")
+            # 제목 글자가 커서 칸을 넉넉히 잡는다 ('번호', '페이지 수' 가 잘리지 않도록)
+            tree.column("no", width=80, anchor="center", stretch=False)
+            tree.column("file_name", width=390, stretch=False)
+            tree.column("file_type", width=100, anchor="center", stretch=False)
+            tree.column("pages", width=150, anchor="center", stretch=False)
+            tree.column("copies", width=110, anchor="center", stretch=False)
 
             tree.pack(pady=(0, 8))
 
