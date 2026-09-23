@@ -83,14 +83,14 @@ DB_NAME = "school_printer.db"
 #   1. 아래 APP_VERSION 을 올린다      (예: 1.0.0 → 1.1.0)
 #   2. exe 를 새로 빌드한다
 #   3. GitHub 저장소 > Releases > 새 릴리스 작성
-#        · 태그 이름 : v1.1.0        (앞의 v 를 반드시 포함)
+#        · 태그 이름 : v1.6.0        (앞의 v 를 반드시 포함)
 #        · 빌드한 exe 파일을 첨부
 #   4. 키오스크에서 관리자 모드 > 보호 기능 설정 > 업데이트 확인
 #
 # 프로그램이 스스로 업데이트를 확인하는 일은 없다.
 # 관리자가 버튼을 눌렀을 때만 확인한다.
 # -----------------------------
-APP_VERSION = "1.5.7"
+APP_VERSION = "1.6.0"
 GITHUB_REPO = "sicgaonnury/printer"
 DEFAULT_ADMIN_PASSWORD = "1234"
 
@@ -1552,13 +1552,21 @@ def clean_temp_dirs(max_age_hours=6):
         if not os.path.isdir(folder):
             continue
 
-        for file_name in os.listdir(folder):
-            path = os.path.join(folder, file_name)
-            try:
-                if os.path.isfile(path) and now - os.path.getmtime(path) > limit:
-                    os.remove(path)
-            except OSError:
-                pass
+        for root, dirs, files in os.walk(folder, topdown=False):
+            for file_name in files:
+                path = os.path.join(root, file_name)
+                try:
+                    if now - os.path.getmtime(path) > limit:
+                        os.remove(path)
+                except OSError:
+                    pass
+
+            # 빈 폴더(암호 푼 복사본을 담던 자리)도 함께 치운다
+            for dir_name in dirs:
+                try:
+                    os.rmdir(os.path.join(root, dir_name))
+                except OSError:
+                    pass
 
 
 def make_temp_pdf_path(original_path):
@@ -1817,6 +1825,179 @@ def get_pdf_path_for_counting(file_path):
     return None
 
 
+# -----------------------------
+# 암호가 걸린 파일
+#
+# 암호가 걸린 파일은 쪽수를 세지도, 미리보기를 만들지도, 인쇄하지도 못한다.
+# 그래서 파일을 고른 직후에 미리 알아내서 학생에게 암호를 물어보고,
+# 암호를 푼 복사본을 임시 폴더에 만들어 그 복사본으로 출력한다.
+# (복사본은 출력이 끝나면 지운다)
+#
+# PDF 와 오피스 파일(워드 · 엑셀 · 파워포인트)은 풀 수 있지만,
+# 한글(HWP · HWPX)은 암호를 푸는 방법이 공개되어 있지 않아 안내만 한다.
+# -----------------------------
+OLE_MAGIC = b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"
+OFFICE_EXTENSIONS = {".docx", ".docm", ".xlsx", ".xlsm", ".pptx", ".pptm", ".doc", ".xls", ".ppt"}
+
+
+class PasswordWrong(Exception):
+    """암호가 틀렸을 때."""
+
+
+class PasswordUnsupported(Exception):
+    """프로그램이 풀 수 없는 형식일 때. (한글 파일 등)"""
+
+
+def _office_is_encrypted(path):
+    try:
+        import msoffcrypto
+
+        with open(path, "rb") as f:
+            return msoffcrypto.OfficeFile(f).is_encrypted()
+    except ImportError:
+        # 해제 도구가 없으면 파일 구조로 짐작한다.
+        # (docx 등은 원래 ZIP 인데, 암호가 걸리면 OLE 형식으로 바뀐다)
+        if os.path.splitext(path)[1].lower() in (".doc", ".xls", ".ppt"):
+            return False
+
+        with open(path, "rb") as f:
+            return f.read(8) == OLE_MAGIC
+    except Exception:
+        return False
+
+
+def _hwp_is_encrypted(path):
+    """한글(HWP 5.0) 파일의 FileHeader 에 있는 암호 표시를 확인한다."""
+    try:
+        import olefile
+
+        if not olefile.isOleFile(path):
+            return False
+
+        ole = olefile.OleFileIO(path)
+        try:
+            if not ole.exists("FileHeader"):
+                return False
+
+            data = ole.openstream("FileHeader").read(40)
+
+            if len(data) < 40:
+                return False
+
+            flags = int.from_bytes(data[36:40], "little")
+            return bool(flags & 0x02)       # 1번 비트 = 암호 설정
+        finally:
+            ole.close()
+    except Exception:
+        return False
+
+
+def _zip_is_encrypted(path):
+    try:
+        import zipfile
+
+        with zipfile.ZipFile(path) as z:
+            return any(info.flag_bits & 0x1 for info in z.infolist())
+    except Exception:
+        return False
+
+
+def detect_locked_file(path):
+    """
+    암호가 걸린 파일인지 확인한다.
+    돌려주는 값은 None(암호 없음) 또는 "pdf" / "office" / "hwp" / "hwpx".
+    """
+    ext = os.path.splitext(path)[1].lower()
+
+    try:
+        if ext == ".pdf":
+            if fitz is None:
+                return None
+
+            doc = fitz.open(path)
+            try:
+                return "pdf" if doc.needs_pass else None
+            finally:
+                doc.close()
+
+        if ext in OFFICE_EXTENSIONS:
+            return "office" if _office_is_encrypted(path) else None
+
+        if ext == ".hwp":
+            return "hwp" if _hwp_is_encrypted(path) else None
+
+        if ext == ".hwpx":
+            return "hwpx" if _zip_is_encrypted(path) else None
+
+    except Exception:
+        return None
+
+    return None
+
+
+def unlocked_copy_path(path):
+    """암호를 푼 복사본을 둘 자리. 원래 파일 이름을 그대로 쓴다."""
+    folder = os.path.join(get_converted_dir(), "unlocked", file_key(path))
+    os.makedirs(folder, exist_ok=True)
+    return os.path.join(folder, os.path.basename(path))
+
+
+def unlock_file(path, password, kind=None):
+    """
+    암호를 풀어 복사본을 만들고 그 경로를 돌려준다.
+    암호가 틀리면 PasswordWrong, 풀 수 없는 형식이면 PasswordUnsupported 를 낸다.
+    """
+    kind = kind or detect_locked_file(path)
+
+    if kind in ("hwp", "hwpx"):
+        raise PasswordUnsupported()
+
+    out_path = unlocked_copy_path(path)
+
+    if kind == "pdf":
+        doc = fitz.open(path)
+        try:
+            if not doc.authenticate(password):
+                raise PasswordWrong()
+
+            doc.save(out_path, encryption=fitz.PDF_ENCRYPT_NONE)
+        finally:
+            doc.close()
+
+        return out_path
+
+    if kind == "office":
+        try:
+            import msoffcrypto
+        except ImportError:
+            raise PasswordUnsupported()
+
+        try:
+            with open(path, "rb") as src, open(out_path, "wb") as dst:
+                office = msoffcrypto.OfficeFile(src)
+                office.load_key(password=password)
+                office.decrypt(dst)
+        except Exception:
+            try:
+                os.remove(out_path)
+            except OSError:
+                pass
+            raise PasswordWrong()
+
+        return out_path
+
+    raise PasswordUnsupported()
+
+
+def is_unlocked_copy(path):
+    """암호를 풀어 만든 임시 복사본인지."""
+    try:
+        base = os.path.join(get_converted_dir(), "unlocked")
+        return os.path.commonpath([os.path.abspath(base), os.path.abspath(path)]) == os.path.abspath(base)
+    except Exception:
+        return False
+
+
 def count_pages_for_print(file_path, converted_cache=None):
     """
     파일 하나의 실제 페이지 수를 센다.
@@ -1945,6 +2126,17 @@ def cleanup_after_print(file_path, printed_pdf_path):
                 os.remove(printed_pdf_path)
         except OSError:
             pass
+
+    # 암호를 풀어 만든 복사본은 설정과 상관없이 바로 지운다.
+    # (암호를 푼 상태로 남아 있으면 안 된다)
+    if is_unlocked_copy(file_path):
+        folder = os.path.dirname(file_path)
+        try:
+            os.remove(file_path)
+            os.rmdir(folder)
+        except OSError:
+            pass
+        return "deleted", 0
 
     if not is_in_download_dir(file_path):
         return None, 0
@@ -3017,7 +3209,7 @@ send.addEventListener('click', function () {
     } else if (xhr.status === 413) {
       status.className = 'err';
       status.textContent = '파일이 너무 큽니다. 한 번에 '
-        + xhr.responseText.replace('TOOBIG:', '') + 'MB 까지 보낼 수 있습니다.';
+        + xhr.responseText.replace('TOOBIG:', '') + ' 까지 보낼 수 있습니다.';
       send.disabled = false;
     } else if (xhr.status === 403) {
       status.className = 'err';
@@ -3405,8 +3597,12 @@ def start_upload_server():
                 content_length = 0
 
             if content_length > MAX_UPLOAD_TOTAL:
-                limit_mb = MAX_UPLOAD_TOTAL // (1024 * 1024)
-                body = f"TOOBIG:{limit_mb}".encode("utf-8")
+                # 학생 화면에 "1GB" 처럼 읽기 쉬운 단위로 보여준다
+                if MAX_UPLOAD_TOTAL >= 1024 ** 3 and MAX_UPLOAD_TOTAL % (1024 ** 3) == 0:
+                    limit_text = f"{MAX_UPLOAD_TOTAL // (1024 ** 3)}GB"
+                else:
+                    limit_text = f"{MAX_UPLOAD_TOTAL // (1024 ** 2)}MB"
+                body = f"TOOBIG:{limit_text}".encode("utf-8")
                 self.send_response(413)
                 self.send_header("Content-Type", "text/plain; charset=utf-8")
                 self.send_header("Content-Length", str(len(body)))
@@ -5376,6 +5572,11 @@ class PrinterKioskApp:
 
         self.body_label(card, "바코드 리더기로 학생증을 찍거나 학생증 코드를 직접 입력하세요.", size=16, muted=True).pack(pady=(0, 6))
         self.body_label(card, "한글 입력 상태여도 학생증 코드는 자동으로 영어 코드로 보정됩니다.", size=14, muted=True).pack()
+        self.body_label(
+            card,
+            "암호가 걸린 한글(HWP) 파일은 출력할 수 없습니다. 암호를 없애거나 PDF로 저장해 오세요.",
+            size=13, muted=True
+        ).pack(pady=(6, 0))
 
     def build_corner_buttons(self):
         """
@@ -6385,7 +6586,145 @@ class PrinterKioskApp:
 
         self.print_confirm_screen(card_code, name, unlimited, file_paths)
 
+    def ask_password(self, file_name, retry=False):
+        """
+        학생에게 파일 암호를 물어본다. 취소하면 None 을 돌려준다.
+        키오스크라 화면 크기에 맞춰 큰 글씨로 만든다.
+        """
+        dialog = ctk.CTkToplevel(self.root)
+        dialog.title("암호 입력")
+        dialog.configure(fg_color=COLOR_CARD)
+        dialog.resizable(False, False)
+        dialog.transient(self.root)
+
+        holder = {"value": None}
+
+        wrap = ctk.CTkFrame(dialog, fg_color="transparent")
+        wrap.pack(padx=44, pady=36)
+
+        self.body_label(
+            wrap,
+            "암호가 걸린 파일입니다" if not retry else "암호가 맞지 않습니다",
+            size=24, bold=True
+        ).pack(pady=(0, 8))
+
+        self.body_label(wrap, file_name, size=15, muted=True).pack(pady=(0, 6))
+        self.body_label(
+            wrap,
+            "파일을 열 때 쓰는 암호를 입력하세요.\n입력한 암호는 저장되지 않습니다.",
+            size=14, muted=True
+        ).pack(pady=(0, 18))
+
+        entry = self.make_entry(wrap, width=380, height=56, font_size=22, show="*")
+        entry.pack(pady=(0, 20))
+
+        def confirm():
+            holder["value"] = entry.get()
+            dialog.destroy()
+
+        def cancel():
+            holder["value"] = None
+            dialog.destroy()
+
+        entry.bind("<Return>", lambda e: confirm())
+        dialog.bind("<Escape>", lambda e: cancel())
+
+        buttons = ctk.CTkFrame(wrap, fg_color="transparent")
+        buttons.pack()
+        self.primary_button(buttons, "확인", confirm, width=160, height=52).grid(row=0, column=0, padx=8)
+        self.secondary_button(buttons, "이 파일 빼기", cancel, width=160, height=52).grid(row=0, column=1, padx=8)
+
+        dialog.update_idletasks()
+        w, h = dialog.winfo_width(), dialog.winfo_height()
+        x = self.root.winfo_rootx() + (self.root.winfo_width() - w) // 2
+        y = self.root.winfo_rooty() + (self.root.winfo_height() - h) // 3
+        dialog.geometry(f"+{max(0, x)}+{max(0, y)}")
+
+        dialog.attributes("-topmost", True)
+        dialog.grab_set()
+        entry.focus_force()
+        self.root.wait_window(dialog)
+
+        self.focus_scan_entry()
+        return holder["value"]
+
+    def unlock_locked_files(self, file_paths):
+        """
+        암호가 걸린 파일이 있으면 암호를 받아 푼 복사본으로 바꿔 준다.
+        풀지 못한 파일은 목록에서 빼고, 마지막에 무엇이 빠졌는지 알려준다.
+        """
+        result = []
+        removed = []
+
+        for path in file_paths:
+            kind = detect_locked_file(path)
+
+            if not kind:
+                result.append(path)
+                continue
+
+            file_name = os.path.basename(path)
+
+            if kind in ("hwp", "hwpx"):
+                messagebox.showwarning(
+                    "암호가 걸린 한글 파일",
+                    f"{file_name}\n\n"
+                    "한글 파일은 암호를 풀 수 없습니다.\n\n"
+                    "한글에서 파일을 연 뒤\n"
+                    "· 보안 → 배포용 문서 · 암호 해제 로 암호를 없애거나\n"
+                    "· PDF로 저장해서 다시 보내 주세요."
+                )
+                removed.append(file_name)
+                continue
+
+            # 암호는 세 번까지 받아 본다
+            unlocked = None
+
+            for attempt in range(3):
+                password = self.ask_password(file_name, retry=(attempt > 0))
+
+                if password is None:
+                    break
+
+                try:
+                    unlocked = unlock_file(path, password, kind)
+                    break
+                except PasswordWrong:
+                    continue
+                except PasswordUnsupported:
+                    messagebox.showwarning(
+                        "암호를 풀 수 없음",
+                        f"{file_name}\n\n이 형식은 암호를 풀 수 없습니다.\n"
+                        "암호를 없애거나 PDF로 저장해서 다시 보내 주세요."
+                    )
+                    break
+                except Exception:
+                    break
+
+            if unlocked:
+                result.append(unlocked)
+            else:
+                removed.append(file_name)
+
+        if removed:
+            messagebox.showinfo(
+                "일부 파일을 뺐습니다",
+                "암호를 확인하지 못해 아래 파일은 출력 목록에서 뺐습니다.\n\n"
+                + "\n".join("· " + n for n in removed[:6])
+            )
+
+        return result
+
     def print_confirm_screen(self, card_code, name, unlimited, file_paths):
+        # 암호가 걸린 파일이 있으면 먼저 암호를 받아 푼다.
+        # (그대로 두면 쪽수도 못 세고 인쇄도 실패한다)
+        file_paths = self.unlock_locked_files(file_paths)
+
+        if not file_paths:
+            # 남은 파일이 없으면 파일 선택 화면으로 되돌린다
+            self.file_screen(card_code, name, unlimited)
+            return
+
         card = self.build_card()
         self.make_title(card, "출력 정보 확인")
 
