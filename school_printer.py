@@ -83,14 +83,14 @@ DB_NAME = "school_printer.db"
 #   1. 아래 APP_VERSION 을 올린다      (예: 1.0.0 → 1.1.0)
 #   2. exe 를 새로 빌드한다
 #   3. GitHub 저장소 > Releases > 새 릴리스 작성
-#        · 태그 이름 : v1.6.2        (앞의 v 를 반드시 포함)
+#        · 태그 이름 : v1.6.3        (앞의 v 를 반드시 포함)
 #        · 빌드한 exe 파일을 첨부
 #   4. 키오스크에서 관리자 모드 > 보호 기능 설정 > 업데이트 확인
 #
 # 프로그램이 스스로 업데이트를 확인하는 일은 없다.
 # 관리자가 버튼을 눌렀을 때만 확인한다.
 # -----------------------------
-APP_VERSION = "1.6.2"
+APP_VERSION = "1.6.3"
 GITHUB_REPO = "sicgaonnury/printer"
 DEFAULT_ADMIN_PASSWORD = "1234"
 
@@ -6634,22 +6634,40 @@ class PrinterKioskApp:
         self.primary_button(buttons, "확인", confirm, width=160, height=52).grid(row=0, column=0, padx=8)
         self.secondary_button(buttons, "이 파일 빼기", cancel, width=160, height=52).grid(row=0, column=1, padx=8)
 
-        # 화면 정중앙에 띄운다.
-        # winfo_width 는 아직 1 로 나올 수 있으므로 실제로 필요한 크기를 쓴다.
-        dialog.update_idletasks()
-        w = max(dialog.winfo_reqwidth(), dialog.winfo_width())
-        h = max(dialog.winfo_reqheight(), dialog.winfo_height())
+        def center_dialog():
+            """
+            창을 화면 정중앙으로 옮긴다.
 
-        screen_w = self.root.winfo_screenwidth()
-        screen_h = self.root.winfo_screenheight()
-        x = max(0, (screen_w - w) // 2)
-        y = max(0, (screen_h - h) // 2)
+            customtkinter 의 geometry() 는 화면 배율(125% 등)을 한 번 더 곱해서
+            창이 커지거나 엉뚱한 자리로 간다. 그래서 크기는 내용에 맡기고,
+            위치만 Tk 에 직접 지시해 배율이 끼어들지 않게 한다.
+            """
+            try:
+                dialog.update_idletasks()
 
-        dialog.geometry(f"{w}x{h}+{x}+{y}")
+                w = dialog.winfo_width()
+                h = dialog.winfo_height()
+
+                if w <= 1 or h <= 1:      # 아직 크기가 정해지지 않았으면 잠시 뒤 다시
+                    dialog.after(30, center_dialog)
+                    return
+
+                x = max(0, (dialog.winfo_screenwidth() - w) // 2)
+                y = max(0, (dialog.winfo_screenheight() - h) // 2)
+
+                dialog.tk.call("wm", "geometry", dialog._w, f"+{x}+{y}")
+            except Exception:
+                pass
+
+        center_dialog()
 
         dialog.attributes("-topmost", True)
         dialog.grab_set()
         entry.focus_force()
+
+        # 창이 다 그려진 뒤 한 번 더 가운데로 맞춘다
+        dialog.after(60, center_dialog)
+
         self.root.wait_window(dialog)
 
         self.focus_scan_entry()
