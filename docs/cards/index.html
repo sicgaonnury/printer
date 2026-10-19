@@ -1,0 +1,1100 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>관리자 카드 제작기 · 가온누리 학생회</title>
+<style>
+
+@import url('https://cdn.jsdelivr.net/npm/pretendard@1.3.9/dist/web/static/pretendard-dynamic-subset.css');
+:root{
+  --bg:#f4f6fb; --panel:#ffffff; --ink:#0e1430; --muted:#5b6474; --faint:#8a93a5;
+  --line:#dde2ee; --accent:#2f6fed; --slate:#4a5468; --danger:#c2413a; --ok:#1f8a5b;
+  --radius:12px;
+  color-scheme:light;
+}
+@media (prefers-color-scheme:dark){
+  :root:not([data-theme="light"]){
+    --bg:#0f1320; --panel:#171d2e; --ink:#eef1f8; --muted:#a4adc2; --faint:#7c869c;
+    --line:#2a3246; --accent:#6d93ff; color-scheme:dark;
+  }
+}
+:root[data-theme="dark"]{
+  --bg:#0f1320; --panel:#171d2e; --ink:#eef1f8; --muted:#a4adc2; --faint:#7c869c;
+  --line:#2a3246; --accent:#6d93ff; color-scheme:dark;
+}
+*{margin:0;padding:0;box-sizing:border-box;word-break:keep-all;}
+html,body{height:100%;}
+body{
+  background:var(--bg); color:var(--ink);
+  font-family:'Pretendard','Apple SD Gothic Neo','Malgun Gothic',system-ui,sans-serif;
+  font-size:14px; line-height:1.5; -webkit-print-color-adjust:exact; print-color-adjust:exact;
+}
+button,input,select{font:inherit;color:inherit;}
+button{cursor:pointer;}
+
+/* ---------- 앱 뼈대 ---------- */
+.wrap{max-width:1500px;margin:0 auto;padding:22px 20px 60px;}
+header.top{display:flex;flex-wrap:wrap;gap:14px;align-items:flex-end;justify-content:space-between;
+  padding-bottom:14px;border-bottom:2px solid var(--ink);margin-bottom:18px;}
+.brand .eyebrow{font-size:11px;font-weight:700;letter-spacing:.42em;color:var(--faint);text-indent:.42em;}
+.brand h1{font-size:27px;font-weight:800;letter-spacing:-.035em;margin-top:5px;}
+.toolbar{display:flex;flex-wrap:wrap;gap:8px;}
+.btn{border:1.5px solid var(--line);background:var(--panel);color:var(--ink);
+  border-radius:9px;padding:9px 14px;font-size:13.5px;font-weight:600;letter-spacing:-.02em;
+  transition:border-color .12s,background .12s;}
+.btn:hover{border-color:var(--accent);}
+.btn.primary{background:var(--accent);border-color:var(--accent);color:#fff;}
+.btn.primary:hover{filter:brightness(1.08);}
+.btn.ghost{background:transparent;}
+.btn.warn{color:var(--danger);}
+.btn:focus-visible,input:focus-visible,select:focus-visible{outline:2px solid var(--accent);outline-offset:2px;}
+
+.cols{display:grid;grid-template-columns:minmax(0,1fr) 300px;gap:20px;align-items:start;}
+@media (max-width:1080px){.cols{grid-template-columns:minmax(0,1fr);}}
+
+.panel{background:var(--panel);border:1.5px solid var(--line);border-radius:var(--radius);}
+.panel>h2{font-size:15px;font-weight:800;letter-spacing:-.03em;padding:13px 16px;border-bottom:1.5px solid var(--line);
+  display:flex;align-items:center;justify-content:space-between;gap:10px;}
+.panel>h2 .sub{font-size:12px;font-weight:500;color:var(--muted);letter-spacing:-.01em;}
+
+/* ---------- 기수 설정줄 ---------- */
+.terms{display:flex;flex-wrap:wrap;align-items:center;gap:10px 18px;
+  background:var(--panel);border:1.5px solid var(--line);border-radius:var(--radius);
+  padding:13px 16px;margin-bottom:16px;}
+.terms .lead{font-size:13.5px;font-weight:800;letter-spacing:-.03em;white-space:nowrap;}
+.terms .grp{display:flex;align-items:center;gap:7px;}
+.terms label{font-size:12.5px;font-weight:600;color:var(--muted);white-space:nowrap;}
+.terms input{width:66px;border:1.5px solid var(--line);background:transparent;border-radius:8px;
+  padding:6px 9px;font-size:14px;font-weight:700;text-align:center;font-variant-numeric:tabular-nums;}
+.terms input:focus{border-color:var(--accent);}
+.terms .unit{font-size:12.5px;font-weight:700;color:var(--muted);margin-left:-3px;}
+.terms .note{font-size:12px;color:var(--muted);line-height:1.55;flex:1;min-width:240px;}
+.terms .note b{color:var(--ink);font-weight:700;}
+.terms .note code{font-weight:700;color:var(--accent);}
+
+/* ---------- 명단 표 ---------- */
+.tablewrap{overflow-x:auto;}
+table{border-collapse:collapse;width:100%;min-width:900px;}
+th,td{padding:7px 8px;border-bottom:1px solid var(--line);text-align:left;vertical-align:middle;}
+th{font-size:11.5px;font-weight:700;color:var(--muted);letter-spacing:-.01em;white-space:nowrap;
+  background:var(--bg);position:sticky;top:0;z-index:2;}
+tbody tr:hover{background:color-mix(in srgb,var(--accent) 5%,transparent);}
+tbody tr.sel{background:color-mix(in srgb,var(--accent) 11%,transparent);}
+td input[type=text]{width:100%;min-width:0;border:1px solid transparent;background:transparent;
+  border-radius:6px;padding:5px 7px;font-size:13.5px;}
+td input[type=text]:hover{border-color:var(--line);}
+td input[type=text]:focus{border-color:var(--accent);background:var(--panel);}
+td input[type=text]::placeholder{color:var(--faint);opacity:.5;font-weight:400;letter-spacing:0;}
+td input[type=text]:disabled{cursor:not-allowed;}
+td.code input,td.pw input{letter-spacing:.02em;font-variant-numeric:tabular-nums;font-weight:600;}
+td.no{font-size:12px;font-weight:700;color:var(--faint);white-space:nowrap;font-variant-numeric:tabular-nums;}
+td.act{white-space:nowrap;}
+.icon{border:1px solid var(--line);background:transparent;border-radius:7px;width:27px;height:27px;
+  font-size:13px;line-height:1;color:var(--muted);}
+.icon:hover{border-color:var(--accent);color:var(--accent);}
+.chk{display:flex;align-items:center;gap:5px;font-size:11.5px;color:var(--muted);white-space:nowrap;}
+.chk input{accent-color:var(--accent);width:15px;height:15px;}
+.rowfoot{display:flex;flex-wrap:wrap;gap:8px;align-items:center;padding:12px 16px;}
+.hintbar{padding:0 16px 14px;font-size:12.5px;color:var(--muted);line-height:1.6;}
+.hintbar b{color:var(--ink);font-weight:700;}
+.warnbar{margin:0 16px 14px;padding:10px 12px;border:1.5px solid #f0c9c9;background:#fdf4f4;
+  border-radius:9px;font-size:12.5px;line-height:1.6;color:#7a3b3b;}
+.warnbar b{color:var(--danger);font-weight:800;}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]) .warnbar{background:#2b1b1d;border-color:#5c3034;color:#f0b9b9;}}
+:root[data-theme="dark"] .warnbar{background:#2b1b1d;border-color:#5c3034;color:#f0b9b9;}
+
+/* ---------- 미리보기 ---------- */
+.side{position:sticky;top:18px;display:flex;flex-direction:column;gap:14px;}
+.previewbox{padding:14px;display:flex;flex-direction:column;align-items:center;gap:12px;}
+.stat{display:flex;flex-direction:column;gap:7px;padding:13px 16px;font-size:12.5px;color:var(--muted);}
+.stat div{display:flex;justify-content:space-between;gap:10px;}
+.stat b{color:var(--ink);font-weight:700;font-variant-numeric:tabular-nums;}
+</style>
+</head>
+<body>
+<style>
+/* ---------- 카드 (화면 미리보기 · 인쇄 공용) ---------- */
+.card{
+  width:58mm;height:90mm;box-sizing:border-box;background:#fff;color:#1c2436;
+  display:flex;flex-direction:column;overflow:hidden;
+  font-family:'Pretendard','Malgun Gothic',sans-serif;
+}
+.card.shadow{box-shadow:0 2px 14px rgba(14,20,48,.16);border-radius:3px;}
+.c-head{height:92px;box-sizing:border-box;padding:13px 14px 12px;display:flex;flex-direction:column;
+  justify-content:space-between;background:#4a5468;}
+.c-head .r1{display:flex;justify-content:space-between;align-items:center;}
+.c-no{font-size:8px;font-weight:700;letter-spacing:2.4px;color:#b7c3dd;font-variant-numeric:tabular-nums;}
+.c-org{font-size:7.5px;font-weight:500;letter-spacing:.2px;color:#b7c3dd;}
+.c-title{font-size:21px;font-weight:800;line-height:1.15;letter-spacing:-.4px;color:#fff;}
+.c-sub{font-size:9px;font-weight:500;letter-spacing:.1px;color:#c9d4ee;margin-top:2px;}
+.c-mid{flex-grow:1;display:flex;flex-direction:column;align-items:center;justify-content:center;
+  gap:10px;padding:8px 14px 0;}
+.c-frame{position:relative;width:134px;height:134px;display:flex;align-items:center;justify-content:center;flex-shrink:0;}
+.c-frame i{position:absolute;width:17px;height:17px;box-sizing:border-box;}
+.c-frame i.tl{left:0;top:0;border-left:2px solid #2f6fed;border-top:2px solid #2f6fed;}
+.c-frame i.tr{right:0;top:0;border-right:2px solid #2f6fed;border-top:2px solid #2f6fed;}
+.c-frame i.bl{left:0;bottom:0;border-left:2px solid #2f6fed;border-bottom:2px solid #2f6fed;}
+.c-frame i.br{right:0;bottom:0;border-right:2px solid #2f6fed;border-bottom:2px solid #2f6fed;}
+.c-frame canvas{width:114px;height:114px;image-rendering:pixelated;display:block;}
+.c-frame .empty{width:114px;height:114px;border:1px dashed #aab3c4;border-radius:2px;background:#f7f8fb;
+  display:flex;align-items:center;justify-content:center;font-size:9px;color:#8a93a5;text-align:center;padding:6px;}
+.c-id{width:100%;display:flex;flex-direction:column;gap:6px;}
+.c-role{text-align:center;font-size:10.5px;font-weight:800;letter-spacing:-.3px;color:#2f6fed;line-height:1.2;min-height:13px;}
+.c-fields{display:flex;gap:8px;align-items:flex-end;}
+.c-field{flex:1;border-bottom:1px solid #c3cad7;padding-bottom:1px;display:flex;align-items:baseline;gap:4px;height:18px;overflow:hidden;}
+.c-field.sid{flex:.85;}
+.c-field.name{flex:1.25;}
+.c-field label{font-size:7px;font-weight:700;color:#8a93a5;white-space:nowrap;}
+.c-field span{font-size:9.5px;font-weight:700;color:#1c2436;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+.c-foot{height:28px;box-sizing:border-box;margin:0 14px;border-top:1px solid #e3e7ee;
+  display:flex;align-items:center;justify-content:space-between;}
+.c-foot span{font-size:8.5px;font-weight:700;letter-spacing:.2px;}
+.c-foot .l{color:#1c2436;} .c-foot .r{color:#5b6474;}
+.c-bar{height:5px;background:#4a5468;}
+
+/* 뒷면 */
+.card.back .c-body{flex-grow:1;box-sizing:border-box;padding:15px 14px 11px;display:flex;
+  flex-direction:column;gap:9px;justify-content:space-between;}
+.b-h{display:flex;flex-direction:column;gap:1px;}
+.b-h .en{font-size:7.5px;font-weight:700;letter-spacing:2px;color:#2f6fed;}
+.b-h .ko{font-size:14px;font-weight:800;letter-spacing:-.3px;color:#1c2436;}
+.b-steps{display:flex;flex-direction:column;gap:7px;}
+.b-step{display:flex;gap:7px;align-items:flex-start;}
+.b-step i{flex-shrink:0;width:14px;height:14px;border-radius:7px;background:#2f6fed;color:#fff;
+  font-size:8px;font-weight:800;font-style:normal;display:flex;align-items:center;justify-content:center;}
+.b-step span{font-size:8.5px;line-height:1.45;color:#2a3346;}
+.b-warn{box-sizing:border-box;border:1px solid #efc4c4;background:#fff6f6;border-radius:6px;
+  padding:7px 9px;display:flex;flex-direction:column;gap:2px;}
+.b-warn b{font-size:8.5px;font-weight:800;color:#a8323a;}
+.b-warn span{font-size:8px;line-height:1.5;color:#5a2a2e;}
+.b-meta{display:flex;flex-direction:column;gap:5px;border-top:1px solid #e3e7ee;padding-top:8px;}
+.b-row{display:flex;align-items:baseline;justify-content:space-between;gap:6px;}
+.b-row .k{font-size:7px;font-weight:700;letter-spacing:.3px;color:#8a93a5;white-space:nowrap;}
+.b-row .v{font-size:9px;font-weight:800;letter-spacing:-.1px;color:#1c2436;text-align:right;
+  font-variant-numeric:tabular-nums;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+.b-note{font-size:7px;line-height:1.4;color:#8a93a5;text-align:right;}
+.card.back .c-foot{height:30px;}
+.card.back .c-foot span{font-size:7.5px;}
+.card.back .c-foot .l{color:#5b6474;font-weight:500;}
+.card.back .c-foot .r{color:#1c2436;font-weight:700;}
+
+/* ---------- 인쇄 시트 ---------- */
+#print{display:none;}
+.sheet{position:relative;width:210mm;height:297mm;overflow:hidden;background:#fff;}
+.slot{position:absolute;width:58mm;height:90mm;overflow:hidden;}
+.vm{position:absolute;width:0;border-left:.3mm solid #9aa3b4;height:5mm;}
+.hm{position:absolute;height:0;border-top:.3mm solid #9aa3b4;width:5mm;}
+.slug{position:absolute;left:0;right:0;bottom:2.5mm;text-align:center;font-size:7.5pt;
+  color:#aab2c0;letter-spacing:.3px;font-variant-numeric:tabular-nums;}
+
+@media print{
+  @page{size:A4;margin:0;}
+  html,body{background:#fff;height:auto;}
+  .wrap{display:none !important;}
+  #print{display:block !important;}
+  .sheet{page-break-after:always;break-after:page;}
+  .sheet:last-child{page-break-after:auto;break-after:auto;}
+  .card.shadow{box-shadow:none;border-radius:0;}
+}
+</style>
+<div class="wrap">
+  <header class="top">
+    <div class="brand">
+      <div class="eyebrow">서인천고등학교 가온누리 학생회</div>
+      <h1>관리자 카드 제작기</h1>
+    </div>
+    <div class="toolbar">
+      <button class="btn" id="btnFill">기본 20명 채우기</button>
+      <button class="btn" id="btnCodes">빈 코드 일괄 생성</button>
+      <button class="btn" id="btnImport">CSV 불러오기</button>
+      <button class="btn" id="btnExport">CSV 내보내기</button>
+      <button class="btn primary" id="btnPrint">인쇄 · PDF 저장</button>
+    </div>
+  </header>
+
+  <div class="terms">
+    <span class="lead">학생회 기수</span>
+    <div class="grp">
+      <label for="term1">1학년</label>
+      <input type="text" id="term1" inputmode="numeric" maxlength="3">
+      <span class="unit">기</span>
+    </div>
+    <div class="grp">
+      <label for="term2">2학년</label>
+      <input type="text" id="term2" inputmode="numeric" maxlength="3">
+      <span class="unit">기</span>
+    </div>
+    <span class="note">
+      관리자 코드 앞의 기수는 <b>학번 만의 자리</b>를 보고 자동으로 맞춰집니다.
+      학번이 <b>1</b>로 시작하면 1학년 기수, <b>2</b>로 시작하면 2학년 기수가 들어갑니다
+      (<code>GN42-…</code> / <code>GN41-…</code>). 학번이 비어 있으면 2학년 기수를 씁니다.
+      카드 뒷면의 <b>“○○기 회장단 사업”</b>에는 2학년 기수가 들어갑니다.
+    </span>
+  </div>
+
+  <div class="cols">
+    <section class="panel">
+      <h2>관리자 명단 <span class="sub" id="countLabel">0명</span></h2>
+
+      <div class="tablewrap">
+        <table>
+          <thead>
+            <tr>
+              <th style="width:70px">번호</th>
+              <th style="width:96px">학번</th>
+              <th style="width:92px">이름</th>
+              <th style="width:150px">직함</th>
+              <th style="width:58px" title="비밀번호 설정 · 관리자 계정 · 작업 기록을 쓸 수 있는 한 사람">총괄</th>
+              <th style="width:168px">관리자 코드</th>
+              <th style="width:206px">비밀번호</th>
+              <th style="width:74px"></th>
+            </tr>
+          </thead>
+          <tbody id="rows"></tbody>
+        </table>
+      </div>
+
+      <div class="rowfoot">
+        <button class="btn" id="btnAdd">+ 한 명 추가</button>
+        <button class="btn ghost warn" id="btnClear">전체 비우기</button>
+      </div>
+
+      <div class="warnbar">
+        <b>비밀번호를 코드와 같게 두면</b> 카드 뒷면에 비밀번호가 그대로 인쇄됩니다.
+        카드를 잃어버리면 스캔 로그인과 수동 로그인이 한꺼번에 뚫립니다.
+        회장 · 부회장처럼 권한이 큰 자리는 체크를 풀어 따로 정하세요.
+        체크를 풀면 카드에는 코드만 인쇄되고, 비밀번호는 CSV에만 남습니다.
+        <br><br>
+        <b>총괄</b>로 고른 한 사람만 프로그램에서 <b>비밀번호 설정 · 관리자 계정 · 작업 기록</b>을 쓸 수 있습니다.
+        나머지는 이용자 관리 · 출력 설정 같은 평소 업무만 할 수 있습니다.
+      </div>
+
+      <div class="hintbar">
+        입력한 내용은 <b>이 브라우저에만</b> 저장됩니다. 서버로 전송되지 않습니다.
+        다른 컴퓨터에서 쓰려면 CSV로 내보낸 뒤 불러오세요.
+        CSV는 프로그램의 <b>admin_list.csv</b> 열 순서(이름 · 학번 · 직함 · 관리자코드 · 비밀번호 · 비고)와 같습니다.
+      </div>
+    </section>
+
+    <aside class="side">
+      <div class="panel previewbox">
+        <div id="pvFront"></div>
+        <div id="pvBack"></div>
+      </div>
+      <div class="panel stat">
+        <div><span>카드 수</span><b id="stCount">0</b></div>
+        <div><span>인쇄 쪽수</span><b id="stPages">0</b></div>
+        <div><span>코드 없음</span><b id="stNoCode">0</b></div>
+        <div><span>코드 중복</span><b id="stDup">0</b></div>
+      </div>
+    </aside>
+  </div>
+</div>
+
+<div id="print"></div>
+<input type="file" id="fileIn" accept=".csv,text/csv" hidden>
+
+<script>
+/* ------------------------------------------------------------------
+   DataMatrix (ECC 200) 인코더 - 정사각 심볼 전용, ASCII 인코딩
+   의존성 없음.  dmEncode(text) -> { size, bits: Uint8Array(size*size) }
+   ------------------------------------------------------------------ */
+(function (root) {
+  'use strict';
+
+  // [행, 열, 데이터바이트, ECC바이트, 지역가로, 지역세로, 지역수]
+  var SQUARES = [
+    [10,10,3,5,8,8,1],      [12,12,5,7,10,10,1],    [14,14,8,10,12,12,1],
+    [16,16,12,12,14,14,1],  [18,18,18,14,16,16,1],  [20,20,22,18,18,18,1],
+    [22,22,30,20,20,20,1],  [24,24,36,24,22,22,1],  [26,26,44,28,24,24,1],
+    [32,32,62,36,14,14,4],  [36,36,86,42,16,16,4],  [40,40,114,48,18,18,4],
+    [44,44,144,56,20,20,4], [48,48,174,68,22,22,4], [52,52,204,84,24,24,4],
+    [64,64,280,112,14,14,16],[72,72,368,144,16,16,16],[80,80,456,192,18,18,16],
+    [88,88,576,224,20,20,16],[96,96,696,272,22,22,16],[104,104,816,336,24,24,16],
+    [120,120,1050,408,18,18,36],[132,132,1304,496,20,20,36],[144,144,1558,620,22,22,36]
+  ];
+  // 144x144 는 인터리브가 달라 여기서는 제외(이 용도에 불필요)
+  var MAX_IDX = 22;
+
+  /* ---------------- GF(256), 원시다항식 0x12D ---------------- */
+  var LOG = new Int16Array(256), ALOG = new Int16Array(256);
+  (function () {
+    var x = 1;
+    for (var i = 0; i < 255; i++) {
+      ALOG[i] = x; LOG[x] = i;
+      x <<= 1;
+      if (x & 0x100) x ^= 0x12D;
+    }
+    ALOG[255] = ALOG[0];
+  })();
+
+  function rsGenerator(n) {
+    var g = [1];
+    for (var i = 1; i <= n; i++) {
+      g.push(0);
+      for (var j = i; j > 0; j--) {
+        var t = g[j - 1] ? ALOG[(LOG[g[j - 1]] + i) % 255] : 0;
+        g[j] = g[j] ^ t;
+      }
+    }
+    return g;
+  }
+
+  function rsEncode(data, nEcc) {
+    var g = rsGenerator(nEcc);
+    var ecc = new Array(nEcc).fill(0);
+    for (var i = 0; i < data.length; i++) {
+      var f = data[i] ^ ecc[0];
+      for (var j = 0; j < nEcc - 1; j++) {
+        ecc[j] = ecc[j + 1] ^ (f ? ALOG[(LOG[g[j + 1]] + LOG[f]) % 255] : 0);
+      }
+      ecc[nEcc - 1] = f ? ALOG[(LOG[g[nEcc]] + LOG[f]) % 255] : 0;
+    }
+    return ecc;
+  }
+
+  /* ---------------- ASCII 인코딩 ---------------- */
+  function encodeAscii(text) {
+    var bytes = [];
+    for (var i = 0; i < text.length; i++) bytes.push(text.charCodeAt(i) & 0xff);
+    var out = [], i2 = 0;
+    while (i2 < bytes.length) {
+      var c = bytes[i2];
+      var d = bytes[i2 + 1];
+      if (c >= 0x30 && c <= 0x39 && d !== undefined && d >= 0x30 && d <= 0x39) {
+        out.push((c - 0x30) * 10 + (d - 0x30) + 130);
+        i2 += 2;
+      } else if (c > 127) {
+        out.push(235); out.push(c - 128 + 1); i2++;
+      } else {
+        out.push(c + 1); i2++;
+      }
+    }
+    return out;
+  }
+
+  function pad(data, capacity) {
+    if (data.length < capacity) data.push(129);            // PAD
+    while (data.length < capacity) {
+      var pos = data.length + 1;
+      var r = ((149 * pos) % 253) + 1;
+      var v = 129 + r;
+      data.push(v > 254 ? v - 254 : v);
+    }
+    return data;
+  }
+
+  /* ---------------- ECC200 모듈 배치 ---------------- */
+  function place(codewords, rows, cols) {
+    var arr = new Int16Array(rows * cols).fill(-1);
+
+    // ISO 16022 의 wrap 규칙 - 단순 modulo 가 아니다
+    function setBit(r, c, chr, bit) {
+      if (r < 0) { r += rows; c += 4 - ((rows + 4) % 8); }
+      if (c < 0) { c += cols; r += 4 - ((cols + 4) % 8); }
+      arr[r * cols + c] = chr * 8 + bit;
+    }
+    function utah(r, c, chr) {
+      setBit(r - 2, c - 2, chr, 0); setBit(r - 2, c - 1, chr, 1);
+      setBit(r - 1, c - 2, chr, 2); setBit(r - 1, c - 1, chr, 3);
+      setBit(r - 1, c,     chr, 4); setBit(r,     c - 2, chr, 5);
+      setBit(r,     c - 1, chr, 6); setBit(r,     c,     chr, 7);
+    }
+    function corner1(chr) {
+      setBit(rows-1,0,chr,0); setBit(rows-1,1,chr,1); setBit(rows-1,2,chr,2);
+      setBit(0,cols-2,chr,3); setBit(0,cols-1,chr,4); setBit(1,cols-1,chr,5);
+      setBit(2,cols-1,chr,6); setBit(3,cols-1,chr,7);
+    }
+    function corner2(chr) {
+      setBit(rows-3,0,chr,0); setBit(rows-2,0,chr,1); setBit(rows-1,0,chr,2);
+      setBit(0,cols-4,chr,3); setBit(0,cols-3,chr,4); setBit(0,cols-2,chr,5);
+      setBit(0,cols-1,chr,6); setBit(1,cols-1,chr,7);
+    }
+    function corner3(chr) {
+      setBit(rows-3,0,chr,0); setBit(rows-2,0,chr,1); setBit(rows-1,0,chr,2);
+      setBit(0,cols-2,chr,3); setBit(0,cols-1,chr,4); setBit(1,cols-1,chr,5);
+      setBit(2,cols-1,chr,6); setBit(3,cols-1,chr,7);
+    }
+    function corner4(chr) {
+      setBit(rows-1,0,chr,0); setBit(rows-1,cols-1,chr,1); setBit(0,cols-3,chr,2);
+      setBit(0,cols-2,chr,3); setBit(0,cols-1,chr,4); setBit(1,cols-3,chr,5);
+      setBit(1,cols-2,chr,6); setBit(1,cols-1,chr,7);
+    }
+
+    var chr = 0, r = 4, c = 0;
+    do {
+      if (r === rows && c === 0) corner1(chr++);
+      if (r === rows - 2 && c === 0 && cols % 4) corner2(chr++);
+      if (r === rows - 2 && c === 0 && cols % 8 === 4) corner3(chr++);
+      if (r === rows + 4 && c === 2 && cols % 8 === 0) corner4(chr++);
+      do {                                   // 오른쪽 위로
+        if (r < rows && c >= 0 && arr[r * cols + c] === -1) utah(r, c, chr++);
+        r -= 2; c += 2;
+      } while (r >= 0 && c < cols);
+      r += 1; c += 3;
+      do {                                   // 왼쪽 아래로
+        if (r >= 0 && c < cols && arr[r * cols + c] === -1) utah(r, c, chr++);
+        r += 2; c -= 2;
+      } while (r < rows && c >= 0);
+      r += 3; c += 1;
+    } while (r < rows || c < cols);
+
+    var last = rows * cols - 1;
+    var bits = new Uint8Array(rows * cols);
+    for (var i = 0; i <= last; i++) {
+      var v = arr[i];
+      if (v === -1) { bits[i] = 0; continue; }
+      bits[i] = (codewords[(v / 8) | 0] >> (7 - (v % 8))) & 1;
+    }
+    if (arr[last] === -1) {                 // 오른쪽 아래 고정 패턴
+      bits[last] = 1;
+      bits[rows * cols - cols - 2] = 1;
+    }
+    return bits;
+  }
+
+  /* ---------------- 지역(region) 합성 + 파인더 패턴 ---------------- */
+  function addFinder(bits, rows, cols, regRows, regCols, nreg) {
+    var perSide = Math.sqrt(nreg) | 0;
+    var fullRows = rows + 2 * perSide;        // 각 지역마다 테두리 2줄
+    var fullCols = cols + 2 * perSide;
+    var out = new Uint8Array(fullRows * fullCols);
+
+    for (var br = 0; br < perSide; br++) {
+      for (var bc = 0; bc < perSide; bc++) {
+        var or_ = br * (regRows + 2);
+        var oc = bc * (regCols + 2);
+        for (var i = 0; i < regRows + 2; i++) out[(or_ + i) * fullCols + oc] = 1;            // 왼쪽 실선
+        for (var j = 0; j < regCols + 2; j++) out[(or_ + regRows + 1) * fullCols + oc + j] = 1; // 아래 실선
+        for (var j2 = 0; j2 < regCols + 2; j2 += 2) out[or_ * fullCols + oc + j2] = 1;        // 위 점선
+        for (var i2 = 1; i2 < regRows + 2; i2 += 2) out[(or_ + i2) * fullCols + oc + regCols + 1] = 1; // 오른쪽 점선
+        for (var y = 0; y < regRows; y++) {
+          for (var x = 0; x < regCols; x++) {
+            out[(or_ + 1 + y) * fullCols + oc + 1 + x] =
+              bits[(br * regRows + y) * cols + bc * regCols + x];
+          }
+        }
+      }
+    }
+    return { size: fullRows, bits: out };
+  }
+
+  /* ---------------- 공개 함수 ---------------- */
+  function dmEncode(text) {
+    var data = encodeAscii(text);
+    var spec = null;
+    for (var i = 0; i <= MAX_IDX; i++) {
+      if (SQUARES[i][2] >= data.length) { spec = SQUARES[i]; break; }
+    }
+    if (!spec) throw new Error('내용이 너무 깁니다.');
+
+    var nData = spec[2], nEcc = spec[3];
+    pad(data, nData);
+
+    var nreg = spec[6];
+    var blocks = (nData > 255) ? Math.ceil(nData / 156) : 1;   // 큰 심볼만 인터리브
+    var cw;
+    if (blocks === 1) {
+      cw = data.concat(rsEncode(data, nEcc));
+    } else {
+      var dBlocks = [], eBlocks = [], b;
+      for (b = 0; b < blocks; b++) dBlocks.push([]);
+      for (var k = 0; k < nData; k++) dBlocks[k % blocks].push(data[k]);
+      var eper = nEcc / blocks;
+      for (b = 0; b < blocks; b++) eBlocks.push(rsEncode(dBlocks[b], eper));
+      cw = data.slice();
+      for (var m = 0; m < eper; m++) for (b = 0; b < blocks; b++) cw.push(eBlocks[b][m]);
+    }
+
+    var regRows = spec[4], regCols = spec[5];
+    var perSide = Math.sqrt(nreg) | 0;
+    var dataRows = regRows * perSide, dataCols = regCols * perSide;
+
+    var bits = place(cw, dataRows, dataCols);
+    return addFinder(bits, dataRows, dataCols, regRows, regCols, nreg);
+  }
+
+  root.dmEncode = dmEncode;
+})(typeof module !== 'undefined' && module.exports ? module.exports : (this.DM = this.DM || {}));
+
+</script>
+<script>
+(function(){
+'use strict';
+var DMX = window.DM;
+
+/* ---------------- 기본값 ---------------- */
+var DEPTS = ['친교부','체육안전부','총무학습부','기획편집부','문화행사부','봉사협력부'];
+var ROLES = ['학생회장','학생부회장'];
+DEPTS.forEach(function(d){
+  ['부장','2학년 차장','1학년 차장'].forEach(function(t){ ROLES.push(d + ' ' + t); });
+});
+
+var ALPHABET = 'ACDEFGHJKMNPQRTUVWXY34679';   // 0·O·1·I·L·2·Z·5·S·8·B 제외
+var KEY = 'gn41.admincards.v1';
+var PER_SHEET = 9, COLS = 3, ROWS = 3;
+var CARD_W = 58, CARD_H = 90;
+var MARG_X = (210 - COLS * CARD_W) / 2;
+var MARG_Y = (297 - ROWS * CARD_H) / 2;
+
+var state = { rows: [], sel: 0, terms: { g1: 42, g2: 41 } };
+
+/* ---------------- 도우미 ---------------- */
+function $(id){ return document.getElementById(id); }
+function el(tag, cls, text){
+  var e = document.createElement(tag);
+  if (cls) e.className = cls;
+  if (text != null) e.textContent = text;
+  return e;
+}
+function randChars(n){
+  var a = new Uint32Array(n);
+  (window.crypto || window.msCrypto).getRandomValues(a);
+  var s = '';
+  for (var i = 0; i < n; i++) s += ALPHABET[a[i] % ALPHABET.length];
+  return s;
+}
+// 학번 만의 자리 -> 기수.  1xxxx = 1학년, 그 밖(빈칸 포함) = 2학년
+function termOf(sid){
+  var d = String(sid || '').replace(/\D/g, '').charAt(0);
+  return (d === '1') ? state.terms.g1 : state.terms.g2;
+}
+function prefixOf(sid){ return 'GN' + termOf(sid); }
+
+function newCode(sid){
+  var used = {}, i;
+  for (i = 0; i < state.rows.length; i++){
+    if (state.rows[i].code) used[state.rows[i].code] = 1;
+    if (state.rows[i].pw) used[state.rows[i].pw] = 1;
+  }
+  var pre = prefixOf(sid) + '-';
+  for (i = 0; i < 400; i++){
+    var c = pre + randChars(4) + '-' + randChars(4);
+    if (!used[c]) return c;
+  }
+  return pre + randChars(4) + '-' + randChars(4);
+}
+
+// 이미 있는 코드의 기수 부분만 현재 규칙에 맞게 고친다
+function retag(code, sid){
+  if (!code) return code;
+  var m = /^GN\d{1,3}(-.*)$/.exec(code);
+  return m ? prefixOf(sid) + m[1] : code;
+}
+function retagRow(r){
+  r.code = retag(r.code, r.sid);
+  if (!r.samePw) r.pw = retag(r.pw, r.sid);
+}
+function retagAll(){ state.rows.forEach(retagRow); }
+function blank(){ return { sid:'', name:'', role:'', code:'', pw:'', samePw:true, chief:false }; }
+function effPw(r){ return r.samePw ? r.code : r.pw; }
+
+/* ---------------- 저장 ---------------- */
+function save(){
+  try { localStorage.setItem(KEY, JSON.stringify({ terms: state.terms, rows: state.rows })); } catch(e){}
+}
+function load(){
+  try {
+    var raw = localStorage.getItem(KEY);
+    if (!raw) return false;
+    var v = JSON.parse(raw);
+    if (v && !Array.isArray(v)){
+      if (v.terms){
+        state.terms.g1 = v.terms.g1 || state.terms.g1;
+        state.terms.g2 = v.terms.g2 || state.terms.g2;
+      }
+      v = v.rows;
+    }
+    if (Array.isArray(v) && v.length){ state.rows = v.map(function(r){
+      return { sid:r.sid||'', name:r.name||'', role:r.role||'', code:r.code||'',
+               pw:r.pw||'', samePw: r.samePw !== false, chief: !!r.chief };
+    }); return true; }
+  } catch(e){}
+  return false;
+}
+
+/* ---------------- DataMatrix 그리기 ---------------- */
+function drawDM(canvas, text, px){
+  var res;
+  try { res = DMX.dmEncode(text); }
+  catch(e){ return false; }
+  var n = res.size, q = 2, side = n + 2 * q;
+  var scale = Math.max(1, Math.floor((px || 456) / side));
+  canvas.width = canvas.height = side * scale;
+  var ctx = canvas.getContext('2d');
+  ctx.fillStyle = '#fff';
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+  ctx.fillStyle = '#000';
+  for (var y = 0; y < n; y++){
+    for (var x = 0; x < n; x++){
+      if (res.bits[y * n + x]) ctx.fillRect((x + q) * scale, (y + q) * scale, scale, scale);
+    }
+  }
+  return true;
+}
+
+/* ---------------- 카드 ---------------- */
+function cardFront(r, idx){
+  var c = el('div', 'card front shadow');
+  var h = el('div', 'c-head');
+  var r1 = el('div', 'r1');
+  r1.appendChild(el('span', 'c-no', 'ADMIN ' + pad2(idx)));
+  r1.appendChild(el('span', 'c-org', '가온누리 학생회'));
+  h.appendChild(r1);
+  var hb = el('div');
+  hb.appendChild(el('div', 'c-title', '관리자 카드'));
+  hb.appendChild(el('div', 'c-sub', '공용 프린터 제어 시스템'));
+  h.appendChild(hb);
+  c.appendChild(h);
+
+  var mid = el('div', 'c-mid');
+  var fr = el('div', 'c-frame');
+  ['tl','tr','bl','br'].forEach(function(k){ fr.appendChild(el('i', k)); });
+  if (r.code){
+    var cv = document.createElement('canvas');
+    if (drawDM(cv, r.code)) fr.appendChild(cv);
+    else fr.appendChild(el('div', 'empty', '코드가 너무 깁니다'));
+  } else {
+    fr.appendChild(el('div', 'empty', '관리자 코드를\n입력하세요'));
+  }
+  mid.appendChild(fr);
+
+  var idw = el('div', 'c-id');
+  idw.appendChild(el('div', 'c-role', r.role || ''));
+  var f = el('div', 'c-fields');
+  f.appendChild(field('sid', '학번', r.sid));
+  f.appendChild(field('name', '이름', r.name));
+  idw.appendChild(f);
+  mid.appendChild(idw);
+  c.appendChild(mid);
+
+  var ft = el('div', 'c-foot');
+  ft.appendChild(el('span', 'l', '서인천고등학교'));
+  ft.appendChild(el('span', 'r', '가온누리 학생회'));
+  c.appendChild(ft);
+  c.appendChild(el('div', 'c-bar'));
+  return c;
+}
+function field(cls, label, val){
+  var d = el('div', 'c-field ' + cls);
+  d.appendChild(el('label', null, label));
+  if (val) d.appendChild(el('span', null, val));
+  return d;
+}
+function pad2(n){ return (n < 10 ? '0' : '') + n; }
+
+function cardBack(r, idx){
+  var c = el('div', 'card back shadow');
+  var b = el('div', 'c-body');
+
+  var hh = el('div', 'b-h');
+  hh.appendChild(el('span', 'en', 'HOW TO USE'));
+  hh.appendChild(el('span', 'ko', '사용 방법'));
+  b.appendChild(hh);
+
+  var st = el('div', 'b-steps');
+  [['1','제어 컴퓨터 첫 화면에서 앞면의 코드를 스캔합니다.'],
+   ['2','필요한 작업을 수행합니다.'],
+   ['3','작업이 끝나면 ‘처음 화면으로’를 눌러 나옵니다.']].forEach(function(s){
+    var d = el('div', 'b-step');
+    d.appendChild(el('i', null, s[0]));
+    d.appendChild(el('span', null, s[1]));
+    st.appendChild(d);
+  });
+  b.appendChild(st);
+
+  var w = el('div', 'b-warn');
+  w.appendChild(el('b', null, '주의'));
+  var ws = el('span');
+  ws.innerHTML = '학생에게 빌려주거나 사진으로 남기지 마세요.<br>잃어버리면 바로 담당자에게 알려 관리자 코드를<br>바꿔 주세요.';
+  w.appendChild(ws);
+  b.appendChild(w);
+
+  var m = el('div', 'b-meta');
+  m.appendChild(metaRow('직함', r.role || '—'));
+  m.appendChild(metaRow(r.samePw ? '코드 · 비밀번호' : '코드', r.code || '—'));
+  if (!r.samePw){
+    m.appendChild(el('div', 'b-note', '비밀번호는 카드에 적지 않습니다. 담당 선생님께 따로 받으세요.'));
+  }
+  b.appendChild(m);
+  c.appendChild(b);
+
+  var ft = el('div', 'c-foot');
+  ft.appendChild(el('span', 'l', state.terms.g2 + '기 회장단 사업'));
+  ft.appendChild(el('span', 'r', '서인천고등학교 가온누리 학생회'));
+  c.appendChild(ft);
+  c.appendChild(el('div', 'c-bar'));
+  return c;
+}
+function metaRow(k, v){
+  var d = el('div', 'b-row');
+  d.appendChild(el('span', 'k', k));
+  d.appendChild(el('span', 'v', v));
+  return d;
+}
+
+/* ---------------- 명단 표 ---------------- */
+function renderRows(){
+  var tb = $('rows');
+  tb.textContent = '';
+  state.rows.forEach(function(r, i){
+    var tr = el('tr');
+    if (i === state.sel) tr.className = 'sel';
+    tr.addEventListener('focusin', function(){ state.sel = i; markSel(); renderPreview(); });
+
+    tr.appendChild(td('no', 'ADMIN ' + pad2(i + 1)));
+    tr.appendChild(inputCell(r, 'sid', '20000', ''));
+    tr.appendChild(inputCell(r, 'name', '홍길동', ''));
+    tr.appendChild(inputCell(r, 'role', '친교부 부장', ''));
+
+    // 총괄 (한 사람만)
+    var tdch = el('td', 'chief');
+    tdch.style.textAlign = 'center';
+    var rb = document.createElement('input');
+    rb.type = 'radio'; rb.name = 'chief'; rb.checked = !!r.chief;
+    rb.title = '비밀번호 설정 · 관리자 계정 · 작업 기록을 쓸 수 있는 한 사람';
+    rb.style.cssText = 'width:17px;height:17px;accent-color:var(--accent);cursor:pointer;';
+    rb.addEventListener('change', function(){
+      state.rows.forEach(function(x){ x.chief = false; });
+      r.chief = true;
+      commit();
+    });
+    tdch.appendChild(rb);
+    tr.appendChild(tdch);
+
+    // 관리자 코드 + 재발급
+    var tdc = el('td', 'code');
+    var box = el('div');
+    box.style.cssText = 'display:flex;gap:4px;align-items:center;';
+    var inp = mkInput(r, 'code', 'GN41-____-____');
+    box.appendChild(inp);
+    var bg = el('button', 'icon', '↻');
+    bg.title = '새 코드 발급';
+    bg.addEventListener('click', function(){ r.code = newCode(r.sid); commit(); });
+    box.appendChild(bg);
+    tdc.appendChild(box);
+    tr.appendChild(tdc);
+
+    // 비밀번호 + 동일 체크
+    var tdp = el('td', 'pw');
+    var pbox = el('div');
+    pbox.style.cssText = 'display:flex;gap:6px;align-items:center;';
+    var pin = mkInput(r, 'pw', '비밀번호');
+    pin.disabled = r.samePw;
+    pin.value = r.samePw ? r.code : r.pw;
+    pin.style.opacity = r.samePw ? '.55' : '1';
+    pbox.appendChild(pin);
+    var lab = el('label', 'chk');
+    var cb = document.createElement('input');
+    cb.type = 'checkbox'; cb.checked = r.samePw;
+    cb.addEventListener('change', function(){
+      r.samePw = cb.checked;
+      if (!r.samePw && !r.pw) r.pw = newCode(r.sid);
+      commit();
+    });
+    lab.appendChild(cb);
+    lab.appendChild(el('span', null, '코드와 동일'));
+    pbox.appendChild(lab);
+    tdp.appendChild(pbox);
+    tr.appendChild(tdp);
+
+    var ta = el('td', 'act');
+    var up = el('button', 'icon', '↑'); up.title = '위로';
+    up.addEventListener('click', function(){ move(i, -1); });
+    var dn = el('button', 'icon', '↓'); dn.title = '아래로';
+    dn.addEventListener('click', function(){ move(i, 1); });
+    var rm = el('button', 'icon', '✕'); rm.title = '삭제';
+    rm.addEventListener('click', function(){
+      state.rows.splice(i, 1);
+      if (state.sel >= state.rows.length) state.sel = Math.max(0, state.rows.length - 1);
+      commit();
+    });
+    ta.appendChild(up); ta.appendChild(dn); ta.appendChild(rm);
+    tr.appendChild(ta);
+
+    tb.appendChild(tr);
+  });
+}
+function td(cls, text){ return el('td', cls, text); }
+function mkInput(r, key, ph){
+  var i = document.createElement('input');
+  i.type = 'text'; i.value = r[key] || ''; i.placeholder = ph;
+  i.addEventListener('input', function(){
+    r[key] = i.value;
+    if (key === 'sid') retagRow(r);
+    save(); renderPreview(); renderStats();
+  });
+  i.addEventListener('change', function(){
+    r[key] = i.value;
+    if (key === 'sid') retagRow(r);
+    commit();
+  });
+  return i;
+}
+function inputCell(r, key, ph){
+  var t = el('td', key);
+  t.appendChild(mkInput(r, key, ph));
+  return t;
+}
+function move(i, d){
+  var j = i + d;
+  if (j < 0 || j >= state.rows.length) return;
+  var t = state.rows[i]; state.rows[i] = state.rows[j]; state.rows[j] = t;
+  state.sel = j; commit();
+}
+function markSel(){
+  var trs = $('rows').children;
+  for (var i = 0; i < trs.length; i++) trs[i].className = (i === state.sel) ? 'sel' : '';
+}
+
+/* ---------------- 미리보기 · 통계 ---------------- */
+function renderPreview(){
+  var r = state.rows[state.sel];
+  var f = $('pvFront'), b = $('pvBack');
+  f.textContent = ''; b.textContent = '';
+  if (!r) return;
+  f.appendChild(cardFront(r, state.sel + 1));
+  b.appendChild(cardBack(r, state.sel + 1));
+}
+function renderStats(){
+  var n = state.rows.length;
+  var noCode = 0, seen = {}, dup = 0;
+  state.rows.forEach(function(r){
+    if (!r.code) noCode++;
+    else { if (seen[r.code]) dup++; seen[r.code] = 1; }
+  });
+  $('stCount').textContent = n;
+  $('stPages').textContent = n ? Math.ceil(n / PER_SHEET) * 2 : 0;
+  $('stNoCode').textContent = noCode;
+  $('stDup').textContent = dup;
+  $('countLabel').textContent = n + '명';
+}
+
+/* ---------------- 인쇄 시트 ---------------- */
+function buildSheets(){
+  var root = $('print');
+  root.textContent = '';
+  var total = Math.ceil(state.rows.length / PER_SHEET);
+  for (var s = 0; s < total; s++){
+    var chunk = state.rows.slice(s * PER_SHEET, (s + 1) * PER_SHEET);
+    var first = s * PER_SHEET + 1, last = s * PER_SHEET + chunk.length;
+    root.appendChild(sheet(chunk, s, false,
+      '앞면 · ' + (s + 1) + '/' + total + '장 · 카드 ' + pad2(first) + '–' + pad2(last)));
+    root.appendChild(sheet(chunk, s, true,
+      '뒷면 · ' + (s + 1) + '/' + total + '장 · 카드 ' + pad2(first) + '–' + pad2(last) + ' (좌우 반전됨)'));
+  }
+}
+function sheet(chunk, sIdx, isBack, label){
+  var sh = el('div', 'sheet');
+  var c, x, y;
+  for (c = 0; c <= COLS; c++){
+    x = MARG_X + c * CARD_W;
+    sh.appendChild(mark('vm', { left: x + 'mm', top: (MARG_Y - 6) + 'mm' }));
+    sh.appendChild(mark('vm', { left: x + 'mm', top: (MARG_Y + ROWS * CARD_H + 1) + 'mm' }));
+  }
+  for (c = 0; c <= ROWS; c++){
+    y = MARG_Y + c * CARD_H;
+    sh.appendChild(mark('hm', { top: y + 'mm', left: (MARG_X - 6) + 'mm' }));
+    sh.appendChild(mark('hm', { top: y + 'mm', left: (MARG_X + COLS * CARD_W + 1) + 'mm' }));
+  }
+  chunk.forEach(function(r, k){
+    var row = Math.floor(k / COLS), col = k % COLS;
+    if (isBack) col = COLS - 1 - col;
+    var slot = el('div', 'slot');
+    slot.style.left = (MARG_X + col * CARD_W) + 'mm';
+    slot.style.top  = (MARG_Y + row * CARD_H) + 'mm';
+    var idx = sIdx * PER_SHEET + k + 1;
+    slot.appendChild(isBack ? cardBack(r, idx) : cardFront(r, idx));
+    sh.appendChild(slot);
+  });
+  sh.appendChild(el('div', 'slug', label));
+  return sh;
+}
+function mark(cls, css){
+  var d = el('div', cls);
+  Object.keys(css).forEach(function(k){ d.style[k] = css[k]; });
+  return d;
+}
+
+/* ---------------- CSV ---------------- */
+function toCsv(){
+  var head = ['이름','학번','직함','권한','관리자코드','비밀번호','비고'];
+  var lines = [head.map(q).join(',')];
+  state.rows.forEach(function(r, i){
+    var note = '카드 ' + pad2(i + 1) + (r.samePw ? '' : '  (비밀번호 별도 — 카드에 인쇄 안 됨)');
+    // 총괄 한 사람만 비밀번호 설정 · 관리자 계정 · 작업 기록을 쓸 수 있다
+    lines.push([r.name, r.sid, r.role, (r.chief ? '총괄' : ''), r.code, effPw(r), note].map(q).join(','));
+  });
+  return '﻿' + lines.join('\r\n') + '\r\n';
+}
+function q(v){
+  v = (v == null ? '' : String(v));
+  return /[",\r\n]/.test(v) ? '"' + v.replace(/"/g, '""') + '"' : v;
+}
+function parseCsv(text){
+  if (text.charCodeAt(0) === 0xFEFF) text = text.slice(1);
+  var rows = [], cur = [], val = '', inQ = false, i = 0;
+  while (i < text.length){
+    var ch = text[i];
+    if (inQ){
+      if (ch === '"'){
+        if (text[i + 1] === '"'){ val += '"'; i += 2; continue; }
+        inQ = false; i++; continue;
+      }
+      val += ch; i++; continue;
+    }
+    if (ch === '"'){ inQ = true; i++; continue; }
+    if (ch === ','){ cur.push(val); val = ''; i++; continue; }
+    if (ch === '\r'){ i++; continue; }
+    if (ch === '\n'){ cur.push(val); rows.push(cur); cur = []; val = ''; i++; continue; }
+    val += ch; i++;
+  }
+  if (val !== '' || cur.length){ cur.push(val); rows.push(cur); }
+  return rows;
+}
+function fromCsv(text){
+  var rows = parseCsv(text).filter(function(r){ return r.join('').trim() !== ''; });
+  if (!rows.length) return [];
+  var head = rows[0].map(function(s){ return s.trim(); });
+  var idx = {};
+  ['이름','학번','직함','권한','관리자코드','비밀번호'].forEach(function(k){ idx[k] = head.indexOf(k); });
+  var body = (idx['관리자코드'] >= 0 || idx['이름'] >= 0) ? rows.slice(1) : rows;
+  if (idx['이름'] < 0){ idx = { '이름':0, '학번':1, '직함':2, '권한':3, '관리자코드':4, '비밀번호':5 }; }
+  return body.map(function(r){
+    var code = (r[idx['관리자코드']] || '').trim();
+    var pw   = (r[idx['비밀번호']] || '').trim();
+    return {
+      name:(r[idx['이름']] || '').trim(),
+      sid:(r[idx['학번']] || '').trim(),
+      role:(r[idx['직함']] || '').trim(),
+      chief: ((r[idx['권한']] || '').trim() === '총괄'),
+      code: code, pw: pw,
+      samePw: (!pw || pw === code)
+    };
+  });
+}
+function download(name, text){
+  var blob = new Blob([text], { type:'text/csv;charset=utf-8' });
+  var url = URL.createObjectURL(blob);
+  var a = document.createElement('a');
+  a.href = url; a.download = name;
+  document.body.appendChild(a); a.click();
+  setTimeout(function(){ URL.revokeObjectURL(url); a.remove(); }, 1000);
+}
+
+/* ---------------- 반영 ---------------- */
+function ensureChief(){
+  if (!state.rows.length) return;
+  var marked = state.rows.filter(function(r){ return r.chief; });
+  if (marked.length === 1) return;
+  state.rows.forEach(function(r){ r.chief = false; });
+  (marked[0] || state.rows[0]).chief = true;
+}
+function commit(){
+  ensureChief();
+  save(); renderRows(); renderPreview(); renderStats(); buildSheets();
+}
+
+/* ---------------- 기수 입력 ---------------- */
+function syncTermInputs(){
+  $('term1').value = state.terms.g1;
+  $('term2').value = state.terms.g2;
+}
+function bindTerm(id, key){
+  var inp = $(id);
+  function apply(){
+    var v = parseInt(String(inp.value).replace(/\D/g, ''), 10);
+    if (!v || v < 1 || v > 999){ inp.value = state.terms[key]; return; }
+    state.terms[key] = v;
+    inp.value = v;
+    retagAll();
+    commit();
+  }
+  inp.addEventListener('change', apply);
+  inp.addEventListener('blur', apply);
+}
+bindTerm('term1', 'g1');
+bindTerm('term2', 'g2');
+
+/* ---------------- 버튼 ---------------- */
+$('btnAdd').addEventListener('click', function(){
+  state.rows.push(blank());
+  state.sel = state.rows.length - 1;
+  commit();
+});
+$('btnFill').addEventListener('click', function(){
+  var keep = state.rows.filter(function(r){
+    return r.name || r.sid || r.code || r.role;
+  });
+  if (keep.length && !window.confirm('현재 명단을 기본 20명(회장 · 부회장 + 6개 부서)으로 바꿉니다. 계속할까요?')) return;
+  state.rows = ROLES.map(function(role, i){
+    var r = blank();
+    r.role = role;
+    r.code = '';
+    r.samePw = (i > 1);                   // 회장 · 부회장은 비밀번호 분리
+    r.chief = (i === 0);                  // 학생회장이 총괄
+    return r;
+  });
+  state.rows.forEach(function(r){
+    r.code = newCode(r.sid);
+    if (!r.samePw) r.pw = newCode(r.sid);
+  });
+  state.sel = 0;
+  commit();
+});
+$('btnCodes').addEventListener('click', function(){
+  state.rows.forEach(function(r){
+    if (!r.code) r.code = newCode(r.sid);
+    if (!r.samePw && !r.pw) r.pw = newCode(r.sid);
+  });
+  retagAll();
+  commit();
+});
+$('btnClear').addEventListener('click', function(){
+  if (!window.confirm('명단을 전부 비웁니다. 되돌릴 수 없습니다. 계속할까요?')) return;
+  state.rows = []; state.sel = 0; commit();
+});
+$('btnExport').addEventListener('click', function(){
+  download('admin_list.csv', toCsv());
+});
+$('btnImport').addEventListener('click', function(){ $('fileIn').click(); });
+$('fileIn').addEventListener('change', function(e){
+  var f = e.target.files[0];
+  if (!f) return;
+  var fr = new FileReader();
+  fr.onload = function(){
+    var rows = fromCsv(String(fr.result));
+    if (!rows.length){ window.alert('CSV에서 읽을 내용을 찾지 못했습니다.'); return; }
+    state.rows = rows; state.sel = 0; retagAll(); commit();
+  };
+  fr.readAsText(f, 'utf-8');
+  e.target.value = '';
+});
+$('btnPrint').addEventListener('click', function(){
+  if (!state.rows.length){ window.alert('먼저 명단을 입력하세요.'); return; }
+  buildSheets();
+  setTimeout(function(){ window.print(); }, 60);
+});
+
+/* ---------------- 시작 ---------------- */
+if (!load()){
+  state.rows = ROLES.map(function(role, i){
+    var r = blank();
+    r.role = role;
+    r.samePw = (i > 1);
+    r.chief = (i === 0);
+    return r;
+  });
+  state.rows.forEach(function(r){
+    r.code = newCode(r.sid);
+    if (!r.samePw) r.pw = newCode(r.sid);
+  });
+}
+syncTermInputs();
+commit();
+})();
+</script>
+
+</body>
+</html>
