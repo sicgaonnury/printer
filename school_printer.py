@@ -90,7 +90,7 @@ DB_NAME = "school_printer.db"
 # 프로그램이 스스로 업데이트를 확인하는 일은 없다.
 # 관리자가 버튼을 눌렀을 때만 확인한다.
 # -----------------------------
-APP_VERSION = "1.6.4"
+APP_VERSION = "1.6.5"
 GITHUB_REPO = "sicgaonnury/printer"
 DEFAULT_ADMIN_PASSWORD = "1234"
 
@@ -9481,12 +9481,12 @@ class PrinterKioskApp:
         tree.heading("note", text="비고")
         # 제목 글자가 커서 칸을 넉넉히 잡는다. (합계 900 — 위 설명 문장 폭과 같아서
         # 표를 넓혀도 화면 전체 폭은 늘지 않는다)
-        tree.column("number", width=110, anchor="center", stretch=False)
-        tree.column("name", width=125, anchor="center", stretch=False)
-        tree.column("title", width=150, anchor="center", stretch=False)
-        tree.column("code", width=185, anchor="center", stretch=False)
-        tree.column("pw", width=150, anchor="center", stretch=False)
-        tree.column("note", width=180, stretch=False)
+        tree.column("number", width=100, anchor="center", stretch=False)
+        tree.column("name", width=115, anchor="center", stretch=False)
+        tree.column("title", width=265, anchor="center", stretch=False)
+        tree.column("code", width=150, anchor="center", stretch=False)
+        tree.column("pw", width=135, anchor="center", stretch=False)
+        tree.column("note", width=135, anchor="center", stretch=False)
         tree.pack(pady=(0, 6))
 
         problem_label = self.body_label(right, "", size=13, wraplength=500, justify="left")
