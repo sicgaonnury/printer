@@ -83,14 +83,14 @@ DB_NAME = "school_printer.db"
 #   1. 아래 APP_VERSION 을 올린다      (예: 1.0.0 → 1.1.0)
 #   2. exe 를 새로 빌드한다
 #   3. GitHub 저장소 > Releases > 새 릴리스 작성
-#        · 태그 이름 : v1.6.3        (앞의 v 를 반드시 포함)
+#        · 태그 이름 : v1.1.0        (앞의 v 를 반드시 포함)
 #        · 빌드한 exe 파일을 첨부
 #   4. 키오스크에서 관리자 모드 > 보호 기능 설정 > 업데이트 확인
 #
 # 프로그램이 스스로 업데이트를 확인하는 일은 없다.
 # 관리자가 버튼을 눌렀을 때만 확인한다.
 # -----------------------------
-APP_VERSION = "1.6.3"
+APP_VERSION = "1.6.4"
 GITHUB_REPO = "sicgaonnury/printer"
 DEFAULT_ADMIN_PASSWORD = "1234"
 
@@ -536,6 +536,10 @@ def init_db():
     add_column_if_missing(cur, "admins", "student_number", "student_number TEXT NOT NULL DEFAULT ''")
     add_column_if_missing(cur, "admins", "title", "title TEXT NOT NULL DEFAULT ''")
 
+    # 총괄 관리자 구분 · 명단 파일에서의 줄 순서
+    add_column_if_missing(cur, "admins", "role", "role TEXT NOT NULL DEFAULT ''")
+    add_column_if_missing(cur, "admins", "seq", "seq INTEGER NOT NULL DEFAULT 0")
+
     # 관리자 작업 기록 (누가 · 언제 · 무엇을)
     cur.execute("""
     CREATE TABLE IF NOT EXISTS admin_logs (
@@ -754,7 +758,9 @@ def export_admin_logs_to_csv(path, actor=None):
 # 관리자 명단 (관리자별 비밀번호 방식)
 #
 # 프로그램 폴더의 admin_list.csv 에 관리자를 적는다.
-#   이름 · 학번 · 직함 · 관리자코드 · 비밀번호 · 비고
+#   이름 · 학번 · 직함 · 권한 · 관리자코드 · 비밀번호 · 비고
+#   '권한' 칸에 '총괄' 이라고 적은 사람만 비밀번호 설정 · 관리자 계정 · 작업 기록을
+#   쓸 수 있다. 아무도 적지 않으면 맨 윗줄 사람(= 카드 01)이 총괄이 된다.
 #   (학번 · 직함은 관리자 화면 위쪽에 '학번 이름 (직함)' 으로 표시된다. 비워도 된다)
 #
 # 비밀번호와 관리자코드는 파일에 오래 두면 안 되므로, 프로그램이 읽는 즉시
@@ -765,8 +771,14 @@ def export_admin_logs_to_csv(path, actor=None):
 # 파일에서 줄을 지우면 그 관리자는 더 이상 들어올 수 없다.
 # -----------------------------
 ADMIN_CSV_NAME = "admin_list.csv"
-ADMIN_CSV_HEADER = ["이름", "학번", "직함", "관리자코드", "비밀번호", "비고"]
+ADMIN_CSV_HEADER = ["이름", "학번", "직함", "권한", "관리자코드", "비밀번호", "비고"]
 REGISTERED_MARK = "(등록됨)"
+
+# 비밀번호 설정 · 관리자 계정 · 작업 기록은 '총괄' 한 사람만 쓸 수 있다.
+ADMIN_ROLE_SUPER = "총괄"
+
+# 명단이 비어 있을 때만 쓰이는 비상 통로. 이 이름들은 총괄로 본다.
+FALLBACK_ADMIN_NAMES = ("관리자", "관리자(메인 비밀번호)", "관리자(메인 코드)")
 
 _admin_csv_state = {"stamp": None, "problems": []}
 
@@ -834,6 +846,62 @@ def describe_admin(name):
     return text
 
 
+def list_admin_roles():
+    """{이름: (권한, 명단 줄번호)}"""
+    conn = connect_db()
+    cur = conn.cursor()
+    cur.execute("SELECT name, role, seq FROM admins")
+    rows = {name: (role or "", seq or 0) for name, role, seq in cur.fetchall()}
+    conn.close()
+    return rows
+
+
+def super_admin_name():
+    """
+    총괄 관리자 한 사람의 이름.
+
+    명단의 '권한' 칸에 '총괄' 이라고 적힌 사람이 있으면 그 사람
+    (여럿이면 명단에서 먼저 나온 사람),
+    아무도 적혀 있지 않으면 명단 맨 윗줄 사람(= 카드 01)을 총괄로 본다.
+    """
+    roles = list_admin_roles()
+
+    if not roles:
+        return ""
+
+    marked = [(seq, name) for name, (role, seq) in roles.items() if role == ADMIN_ROLE_SUPER]
+
+    if marked:
+        return min(marked)[1]
+
+    return min((seq, name) for name, (role, seq) in roles.items())[1]
+
+
+def is_super_admin(name):
+    if not name:
+        return False
+
+    # 명단을 읽지 못했을 때 쓰는 비상 통로는 총괄로 본다 (아무도 못 들어가면 안 되므로)
+    if name in FALLBACK_ADMIN_NAMES:
+        return True
+
+    top = super_admin_name()
+    return (not top) or (name == top)
+
+
+def admin_can_manage(name=None):
+    """
+    총괄 전용 기능(비밀번호 설정 · 관리자 계정 · 작업 기록)을 쓸 수 있는지.
+
+    단일 방식은 비밀번호가 하나뿐이라 누가 들어왔는지 가릴 수 없으므로 막지 않는다.
+    개별 방식에서만 총괄 한 사람으로 제한한다.
+    """
+    if get_admin_mode() != "individual":
+        return True
+
+    return is_super_admin(current_admin() if name is None else name)
+
+
 def find_admin_by_password(password):
     if not password:
         return None
@@ -896,7 +964,7 @@ def sync_admin_csv(force=False):
         return header.index(label) if label in header else -1
 
     i_name, i_code, i_pw, i_note = col("이름"), col("관리자코드"), col("비밀번호"), col("비고")
-    i_number, i_title = col("학번"), col("직함")
+    i_number, i_title, i_role = col("학번"), col("직함"), col("권한")
 
     if i_name < 0:
         _admin_csv_state["problems"] = ["첫 줄에 '이름' 칸이 없습니다. 제목 줄을 확인하세요."]
@@ -905,7 +973,10 @@ def sync_admin_csv(force=False):
 
     existing = {name: (pw, code, note) for name, pw, code, note in list_admins()}
     old_profiles = list_admin_profiles()
+    old_roles = list_admin_roles()
     profiles = {}
+    roles = {}
+    seqs = {}
     result = {}
     problems = []
     rewritten = [ADMIN_CSV_HEADER]
@@ -929,6 +1000,8 @@ def sync_admin_csv(force=False):
         pw_cell, code_cell = cell(row, i_pw), cell(row, i_code)
         note = cell(row, i_note)
         profiles[name] = (cell(row, i_number), cell(row, i_title))
+        roles[name] = ADMIN_ROLE_SUPER if cell(row, i_role) == ADMIN_ROLE_SUPER else ""
+        seqs[name] = len(result) + 1
 
         # 비밀번호
         if pw_cell == REGISTERED_MARK:
@@ -959,6 +1032,7 @@ def sync_admin_csv(force=False):
             name,
             profiles[name][0],
             profiles[name][1],
+            roles[name],
             REGISTERED_MARK if code_hash else "",
             REGISTERED_MARK if pw_hash else "",
             note,
@@ -997,6 +1071,10 @@ def sync_admin_csv(force=False):
     dedupe(new_pws, 0, "비밀번호")
     dedupe(new_codes, 1, "관리자코드")
 
+    # 아무도 '총괄' 로 적혀 있지 않으면 맨 윗줄 사람을 총괄로 정한다.
+    if order and not any(roles.get(n) == ADMIN_ROLE_SUPER for n in order):
+        roles[order[0]] = ADMIN_ROLE_SUPER
+
     # 반영 (명단에서 빠진 관리자는 지운다 → 더 이상 들어올 수 없다)
     changes = []
     conn = connect_db()
@@ -1015,6 +1093,7 @@ def sync_admin_csv(force=False):
             if old[1] != code_hash: parts.append("관리자코드")
             if old_number != number: parts.append("학번")
             if old_title != title: parts.append("직함")
+            if old_roles.get(name, ("", 0))[0] != roles.get(name, ""): parts.append("권한")
             if old[2] != note: parts.append("비고")
             if parts:
                 changes.append(f"변경: {name} ({', '.join(parts)})")
@@ -1022,12 +1101,14 @@ def sync_admin_csv(force=False):
         number, title = profiles.get(name, ("", ""))
 
         cur.execute("""
-        INSERT INTO admins(name, password_hash, code_hash, note, updated, student_number, title)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO admins(name, password_hash, code_hash, note, updated, student_number, title, role, seq)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(name) DO UPDATE SET password_hash=excluded.password_hash,
             code_hash=excluded.code_hash, note=excluded.note, updated=excluded.updated,
-            student_number=excluded.student_number, title=excluded.title
-        """, (name, pw_hash, code_hash, note, today, number, title))
+            student_number=excluded.student_number, title=excluded.title,
+            role=excluded.role, seq=excluded.seq
+        """, (name, pw_hash, code_hash, note, today, number, title,
+              roles.get(name, ""), seqs.get(name, 0)))
 
     for name in existing:
         if name not in result:
@@ -1040,8 +1121,9 @@ def sync_admin_csv(force=False):
     # 파일의 비밀번호 · 코드 칸을 '(등록됨)' 으로 바꿔 쓴다 (평문이 파일에 남지 않도록)
     for r in rewritten[1:]:
         name = r[0]
-        r[3] = REGISTERED_MARK if result[name][1] else ""
-        r[4] = REGISTERED_MARK if result[name][0] else ""
+        r[3] = roles.get(name, "")
+        r[4] = REGISTERED_MARK if result[name][1] else ""
+        r[5] = REGISTERED_MARK if result[name][0] else ""
 
     try:
         with open(path, "w", encoding="utf-8-sig", newline="") as f:
@@ -7815,11 +7897,33 @@ class PrinterKioskApp:
         self.primary_button(card, "로그인", check_password, width=240, height=54).pack(pady=(0, 14))
         self.link_button(card, "처음 화면으로", self.start_screen, width=180, height=42).pack()
 
+    def require_manage_rights(self):
+        """
+        총괄 전용 기능에 들어갈 수 있는지 확인한다.
+        들어갈 수 없으면 안내하고 관리자 메뉴로 돌려보낸 뒤 False 를 돌려준다.
+        """
+        if admin_can_manage():
+            return True
+
+        top = describe_admin(super_admin_name()) or super_admin_name()
+
+        admin_log("권한 없음", "총괄 전용 기능에 접근 시도")
+        messagebox.showwarning(
+            "총괄 관리자 전용",
+            "비밀번호 설정 · 관리자 계정 · 작업 기록은\n"
+            "총괄 관리자만 사용할 수 있습니다.\n\n"
+            f"총괄 관리자: {top or '명단에서 정해지지 않음'}"
+        )
+        self.admin_menu()
+        return False
+
     def admin_menu(self):
         # 로그인하지 않고 관리자 화면에 들어오는 길은 막는다
         if not admin_session_active():
             self.admin_login_screen()
             return
+
+        can_manage = admin_can_manage()
 
         card = self.build_card()
         self.make_title(card, "관리자 모드")
@@ -7827,7 +7931,16 @@ class PrinterKioskApp:
         self.body_label(
             card, f"{describe_admin(current_admin()) or current_admin()} 님으로 들어왔습니다 · 이 화면에서 한 작업은 모두 기록됩니다",
             size=13, muted=True
-        ).pack(pady=(0, 14))
+        ).pack(pady=(0, 4 if not can_manage else 14))
+
+        if not can_manage:
+            top = describe_admin(super_admin_name()) or super_admin_name()
+            self.body_label(
+                card,
+                "비밀번호 설정 · 관리자 계정 · 작업 기록은 총괄 관리자만 쓸 수 있습니다"
+                + (f" · 총괄: {top}" if top else ""),
+                size=13, muted=True
+            ).pack(pady=(0, 14))
 
         buttons = [
             ("이용자 관리", self.user_manage_screen),
@@ -7843,15 +7956,21 @@ class PrinterKioskApp:
 
         for i, (text, cmd) in enumerate(buttons):
             row, col = divmod(i, 2)
-            self.secondary_button(
+            btn = self.secondary_button(
                 grid_frame, text, cmd, width=340, height=64, font_size=18
-            ).grid(row=row, column=col, padx=10, pady=10)
+            )
+            if text == "비밀번호 설정" and not can_manage:
+                btn.configure(state="disabled", text="비밀번호 설정 (총괄 전용)")
+            btn.grid(row=row, column=col, padx=10, pady=10)
 
         # 관리자 방식 · 명단 · 작업 기록 (두 칸을 합친 넓은 버튼)
-        self.secondary_button(
+        account_btn = self.secondary_button(
             grid_frame, "관리자 계정 · 작업 기록", self.admin_account_screen,
             width=700, height=56, font_size=17
-        ).grid(row=len(buttons) // 2, column=0, columnspan=2, padx=10, pady=(6, 10))
+        )
+        if not can_manage:
+            account_btn.configure(state="disabled", text="관리자 계정 · 작업 기록 (총괄 전용)")
+        account_btn.grid(row=len(buttons) // 2, column=0, columnspan=2, padx=10, pady=(6, 10))
 
         bottom_frame = ctk.CTkFrame(card, fg_color="transparent")
         bottom_frame.pack()
@@ -9133,6 +9252,9 @@ class PrinterKioskApp:
         messagebox.showinfo("완료", "전체 출력 기록을 초기화했습니다.")
 
     def change_admin_password_screen(self):
+        if not self.require_manage_rights():
+            return
+
         card = self.build_card()
         self.make_title(card, "비밀번호 설정")
 
@@ -9240,6 +9362,9 @@ class PrinterKioskApp:
         개별 방식  : admin_list.csv 에 적힌 사람마다 비밀번호와 관리자코드를 따로 두고,
                      기록에는 그 사람 이름으로 남는다.
         """
+        if not self.require_manage_rights():
+            return
+
         card = self.build_card()
         self.make_title(card, "관리자 계정 · 작업 기록")
 
@@ -9331,8 +9456,16 @@ class PrinterKioskApp:
         self.body_label(right, "관리자 명단", size=19, bold=True).pack(pady=(0, 6))
         self.body_label(
             right,
-            f"프로그램 폴더의 {ADMIN_CSV_NAME} 에 이름 · 학번 · 직함 · 관리자코드 · 비밀번호를 적고 저장하면\n"
+            f"프로그램 폴더의 {ADMIN_CSV_NAME} 에 이름 · 학번 · 직함 · 권한 · 관리자코드 · 비밀번호를 적고 저장하면\n"
             "몇 초 안에 반영됩니다. 적은 비밀번호와 코드는 곧바로 '(등록됨)' 으로 가려집니다.",
+            size=13, muted=True
+        ).pack(pady=(0, 4))
+
+        top_admin = describe_admin(super_admin_name()) or super_admin_name()
+        self.body_label(
+            right,
+            "'권한' 칸에 '총괄' 이라고 적은 사람만 이 화면과 비밀번호 설정을 쓸 수 있습니다"
+            + (f"\n지금 총괄: {top_admin}" if top_admin else "\n아직 총괄이 정해지지 않았습니다 (명단 맨 윗줄이 총괄이 됩니다)"),
             size=13, muted=True
         ).pack(pady=(0, 8))
 
@@ -9412,6 +9545,9 @@ class PrinterKioskApp:
 
     def admin_log_screen(self):
         """누가 · 언제 · 무엇을 했는지 보는 화면."""
+        if not self.require_manage_rights():
+            return
+
         card = self.build_card()
         self.make_title(card, "관리자 작업 기록")
 
