@@ -68,9 +68,18 @@ except ImportError:
     Image = None
     ImageTk = None
 
+# PyMuPDF 2.0 부터는 import 하는 순간 'pymupdf.layout'(ONNX 레이아웃 분석기)를
+# 자동으로 불러오면서 모델 파일(.yaml/.onnx)을 읽는다. exe 로 묶으면 그 파일이
+# 빠져 있어 프로그램이 켜지지도 않는다. 이 프로그램은 레이아웃 분석을 쓰지 않으므로
+# 미리 막아 둔다. (막아 두면 PyMuPDF 가 ImportError 로 받아 조용히 건너뛴다)
+sys.modules.setdefault("pymupdf.layout", None)
+
 try:
-    import fitz  # PyMuPDF
-except ImportError:
+    # 'fitz' 라는 이름은 PyMuPDF 에서 없어질 예정이라 새 이름으로 불러온다
+    import pymupdf as fitz  # PyMuPDF
+except Exception:
+    # ImportError 만 잡으면 위와 같은 파일 누락(FileNotFoundError)에 프로그램 전체가
+    # 죽는다. PDF 미리보기 · 쪽수 계산만 꺼지고 나머지는 동작하도록 넓게 잡는다.
     fitz = None
 
 
@@ -90,7 +99,7 @@ DB_NAME = "school_printer.db"
 # 프로그램이 스스로 업데이트를 확인하는 일은 없다.
 # 관리자가 버튼을 눌렀을 때만 확인한다.
 # -----------------------------
-APP_VERSION = "1.6.5"
+APP_VERSION = "1.6.6"
 GITHUB_REPO = "sicgaonnury/printer"
 DEFAULT_ADMIN_PASSWORD = "1234"
 

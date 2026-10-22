@@ -1,0 +1,205 @@
+name: Build (exe + 설치 프로그램)
+
+# ==========================================================================
+#  v1.6.3 처럼 v 로 시작하는 태그를 올리면
+#    1) PyInstaller 로 exe 를 만들고
+#    2) Inno Setup 으로 "통합 설치 프로그램" 을 만들어
+#    3) 릴리스에 자동으로 첨부한다.
+#
+#  저장소에 있어야 하는 파일
+#    school_printer.py
+#    icon.ico
+#    requirements.txt
+#    installer/SchoolPrinterSetup.iss
+#    installer/install-deps.ps1
+#    installer/필수프로그램_설치.bat        (선택)
+#    docs/*.pdf                             (선택 - 설명서를 함께 설치)
+# ==========================================================================
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: '버전 (예: 1.6.3) - 태그 없이 시험 빌드할 때만'
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: 소스 가져오기
+        uses: actions/checkout@v4
+
+      - name: Python 준비
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: 패키지 설치
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller
+
+      - name: 버전 확인 (태그와 APP_VERSION 이 같은지)
+        id: ver
+        shell: pwsh
+        run: |
+          $src = Get-Content school_printer.py -Raw -Encoding UTF8
+          if ($src -notmatch 'APP_VERSION\s*=\s*"([^"]+)"') {
+            Write-Error "school_printer.py 에서 APP_VERSION 을 찾을 수 없습니다."
+            exit 1
+          }
+          $appVer = $Matches[1]
+          Write-Host "APP_VERSION = $appVer"
+
+          if ("${{ github.ref_type }}" -eq "tag") {
+            $tag = "${{ github.ref_name }}"
+            $tagVer = $tag.TrimStart('v')
+            if ($tagVer -ne $appVer) {
+              Write-Error "태그($tag)와 APP_VERSION($appVer)이 다릅니다. school_printer.py 의 APP_VERSION 을 먼저 고치세요."
+              exit 1
+            }
+          } else {
+            $tag = "v$appVer"
+          }
+
+          "version=$appVer" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "tag=$tag"        | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+
+      - name: exe 빌드
+        shell: pwsh
+        run: |
+          python -m PyInstaller `
+            --onefile --windowed `
+            --name SchoolPrinter `
+            --icon=icon.ico `
+            --add-data "icon.ico;." `
+            --collect-all customtkinter `
+            --exclude-module pymupdf.layout `
+            --exclude-module onnxruntime `
+            school_printer.py
+          if (-not (Test-Path "dist\SchoolPrinter.exe")) {
+            Write-Error "exe 가 만들어지지 않았습니다."
+            exit 1
+          }
+          "{0:N1} MB" -f ((Get-Item "dist\SchoolPrinter.exe").Length / 1MB)
+
+      - name: 설치 프로그램에 넣을 파일 모으기
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path "installer\payload" -Force | Out-Null
+          Copy-Item "dist\SchoolPrinter.exe" "installer\payload\" -Force
+          Copy-Item "icon.ico"               "installer\payload\" -Force
+
+          # 설명서(PDF)가 저장소에 있으면 함께 설치한다.
+          if (Test-Path "docs") {
+            New-Item -ItemType Directory -Path "installer\payload\docs" -Force | Out-Null
+            Get-ChildItem "docs" -Filter *.pdf -ErrorAction SilentlyContinue |
+              Copy-Item -Destination "installer\payload\docs\" -Force
+          }
+          Get-ChildItem "installer\payload" -Recurse | Select-Object FullName, Length
+
+      - name: Inno Setup 준비 (최신 버전으로)
+        shell: pwsh
+        run: |
+          # 러너에 미리 깔린 버전이 오래되면 일부 설정을 못 읽으므로 항상 최신으로 올린다.
+          choco upgrade innosetup -y --no-progress
+          $iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) {
+            Write-Error "Inno Setup 을 준비하지 못했습니다."
+            exit 1
+          }
+          "ISCC=$iscc" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: 한국어 메시지 파일 받기 (없어도 계속 진행)
+        id: korean
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $dir = "C:\Program Files (x86)\Inno Setup 6\Languages"
+          New-Item -ItemType Directory -Path $dir -Force | Out-Null
+          $url = "https://raw.githubusercontent.com/jrsoftware/issrc/main/Files/Languages/Unofficial/Korean.isl"
+          Invoke-WebRequest -Uri $url -OutFile (Join-Path $dir "Korean.isl") -UseBasicParsing
+          if ((Get-Item (Join-Path $dir "Korean.isl")).Length -lt 1000) {
+            throw "Korean.isl 이 정상적으로 내려오지 않았습니다."
+          }
+          Write-Host "Korean.isl 준비 완료"
+
+      - name: 설치 프로그램 빌드
+        shell: pwsh
+        run: |
+          $defs = @("/DMyAppVersion=${{ steps.ver.outputs.version }}")
+          if ("${{ steps.korean.outcome }}" -eq "success") {
+            $defs += "/DUseKorean"
+            Write-Host "한국어 설치 화면으로 빌드합니다."
+          } else {
+            Write-Host "Korean.isl 을 못 받아 영어 설치 화면으로 빌드합니다."
+          }
+
+          Push-Location installer
+          & $env:ISCC @defs "SchoolPrinterSetup.iss"
+          if ($LASTEXITCODE -ne 0) { Pop-Location; exit 1 }
+          Pop-Location
+
+          Get-ChildItem "installer\output" | Select-Object Name, Length
+
+      - name: 릴리스용 이름으로 정리
+        shell: pwsh
+        run: |
+          $tag = "${{ steps.ver.outputs.tag }}"
+          $ver = "${{ steps.ver.outputs.version }}"
+          New-Item -ItemType Directory -Path "release" -Force | Out-Null
+
+          Copy-Item "installer\output\SchoolPrinterSetup-$ver.exe" `
+                    "release\SchoolPrinterSetup-$tag.exe" -Force
+          Copy-Item "dist\SchoolPrinter.exe" "release\SchoolPrinter-$tag.exe" -Force
+
+          if (Test-Path "installer\install-deps.ps1") {
+            Copy-Item "installer\install-deps.ps1" "release\" -Force
+          }
+          Get-ChildItem "release" | Select-Object Name, Length
+
+      - name: 빌드 결과 보관 (태그가 아닐 때도 내려받을 수 있게)
+        uses: actions/upload-artifact@v4
+        with:
+          name: SchoolPrinter-${{ steps.ver.outputs.tag }}
+          path: release/*
+          retention-days: 30
+
+      - name: 릴리스에 첨부
+        if: github.ref_type == 'tag'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          files: release/*
+          body: |
+            ## 서인천고등학교 공용 프린터 제어 시스템 ${{ steps.ver.outputs.tag }}
+
+            ### 설치 방법
+            **`SchoolPrinterSetup-${{ steps.ver.outputs.tag }}.exe`** 하나만 내려받아 실행하세요.
+
+            프로그램 본체를 설치하고, 필요한 보조 프로그램을
+            **설치하는 시점의 최신 버전으로 공식 사이트에서 자동으로 내려받아** 설치합니다.
+
+            - SumatraPDF (인쇄)
+            - LibreOffice (한글 · 워드 · 엑셀 → PDF 변환, 약 350MB)
+            - H2Orestart 확장 (한글 hwp/hwpx 변환)
+            - 파일 전송용 방화벽 규칙 (TCP 8888)
+
+            설치 중 인터넷 연결이 필요하며, 네트워크 속도에 따라 5~20분 걸립니다.
+            이미 깔려 있는 항목은 건너뜁니다.
+
+            ### 그 밖의 파일
+            | 파일 | 설명 |
+            |---|---|
+            | `SchoolPrinter-${{ steps.ver.outputs.tag }}.exe` | 프로그램 본체만 (보조 프로그램은 직접 설치) |
+            | `install-deps.ps1` | 보조 프로그램만 최신 버전으로 설치/재설치 |
