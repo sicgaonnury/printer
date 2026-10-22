@@ -2,7 +2,9 @@
 customtkinter
 pywin32
 pillow
-pymupdf
+# PyMuPDF 2.0 은 레이아웃 분석기(onnxruntime 등)를 강제로 끌어오고,
+# exe 로 묶으면 모델 파일이 빠져 프로그램이 켜지지 않는다. 1.x 에 고정한다.
+pymupdf==1.28.2
 openpyxl
 qrcode
 msoffcrypto-tool
