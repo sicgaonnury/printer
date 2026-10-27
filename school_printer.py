@@ -99,7 +99,7 @@ DB_NAME = "school_printer.db"
 # 프로그램이 스스로 업데이트를 확인하는 일은 없다.
 # 관리자가 버튼을 눌렀을 때만 확인한다.
 # -----------------------------
-APP_VERSION = "1.6.8"
+APP_VERSION = "1.6.9"
 GITHUB_REPO = "sicgaonnury/printer"
 DEFAULT_ADMIN_PASSWORD = "1234"
 
@@ -9876,18 +9876,41 @@ class PrinterKioskApp:
         self.link_button(buttons, "뒤로", self.admin_account_screen, width=140).grid(row=0, column=1, padx=8)
 
     def shutdown_schedule_screen(self):
+        """
+        자동 종료 일정 관리.
+
+        목록 · 추가 칸 · 버튼을 위아래로 쌓으면 FHD(특히 배율 125%) 화면에서
+        아래쪽 버튼이 잘리므로 좌우 두 칸으로 나눈다.
+          왼쪽 : 등록된 일정 목록 + 삭제 버튼
+          오른쪽: 새 일정 추가
+        """
         card = self.build_card()
         self.make_title(card, "자동 종료 일정 관리")
 
         # 지나간 1회 일정은 자동 정리
         cleanup_past_schedules()
 
-        # ── 등록된 일정 목록 ──
+        columns = ctk.CTkFrame(card, fg_color="transparent")
+        columns.pack(pady=(0, 6))
+
+        left = ctk.CTkFrame(columns, fg_color="transparent")
+        left.grid(row=0, column=0, padx=(0, 28), sticky="n")
+
+        ctk.CTkFrame(columns, fg_color=COLOR_BORDER, width=1).grid(
+            row=0, column=1, sticky="ns", pady=6
+        )
+
+        right = ctk.CTkFrame(columns, fg_color="transparent")
+        right.grid(row=0, column=2, padx=(28, 0), sticky="n")
+
+        # ── 왼쪽: 등록된 일정 목록 ──
+        self.body_label(left, "등록된 일정", size=17, bold=True).pack(pady=(0, 10))
+
         tree = ttk.Treeview(
-            card,
+            left,
             columns=("id", "kind", "when", "time"),
             show="headings",
-            height=8,
+            height=7,
             style="App.Treeview"
         )
 
@@ -9896,12 +9919,12 @@ class PrinterKioskApp:
         tree.heading("when", text="요일 / 날짜")
         tree.heading("time", text="시각")
 
-        tree.column("id", width=70, anchor="center", stretch=False)
-        tree.column("kind", width=140, anchor="center", stretch=False)
-        tree.column("when", width=320, stretch=False)
-        tree.column("time", width=140, anchor="center", stretch=False)
+        tree.column("id", width=60, anchor="center", stretch=False)
+        tree.column("kind", width=110, anchor="center", stretch=False)
+        tree.column("when", width=250, stretch=False)
+        tree.column("time", width=90, anchor="center", stretch=False)
 
-        tree.pack(pady=(0, 10))
+        tree.pack(pady=(0, 12))
 
         def refresh_list():
             for row in tree.get_children():
@@ -9915,27 +9938,24 @@ class PrinterKioskApp:
                     values=(schedule_id, kind_text, when_text, time_text)
                 )
 
-        # ── 새 일정 추가 ──
-        divider = ctk.CTkFrame(card, fg_color=COLOR_BORDER, height=1)
-        divider.pack(fill="x", pady=(6, 18))
-
-        self.body_label(card, "새 일정 추가", size=17, bold=True).pack(pady=(0, 12))
+        # ── 오른쪽: 새 일정 추가 ──
+        self.body_label(right, "새 일정 추가", size=17, bold=True).pack(pady=(0, 10))
 
         kind_var = tk.StringVar(value="weekly")
 
-        kind_frame = ctk.CTkFrame(card, fg_color="transparent")
-        kind_frame.pack(pady=(0, 14))
+        kind_frame = ctk.CTkFrame(right, fg_color="transparent")
+        kind_frame.pack(pady=(0, 10))
 
-        add_frame = ctk.CTkFrame(card, fg_color=COLOR_ENTRY_BG, corner_radius=14)
-        add_frame.pack(pady=(0, 14), ipadx=16, ipady=16)
+        add_frame = ctk.CTkFrame(right, fg_color=COLOR_ENTRY_BG, corner_radius=14)
+        add_frame.pack(pady=(0, 12), ipadx=14, ipady=12)
 
         # 요일 선택 영역
         weekly_frame = ctk.CTkFrame(add_frame, fg_color="transparent")
 
-        self.body_label(weekly_frame, "반복할 요일", size=15).pack(pady=(0, 8))
+        self.body_label(weekly_frame, "반복할 요일", size=15).pack(pady=(0, 6))
 
         day_row = ctk.CTkFrame(weekly_frame, fg_color="transparent")
-        day_row.pack(pady=(0, 10))
+        day_row.pack(pady=(0, 8))
 
         day_vars = {}
 
@@ -9949,12 +9969,12 @@ class PrinterKioskApp:
                 variable=var,
                 onvalue=1,
                 offvalue=0,
-                width=58,
+                width=54,
                 font=(self.font_family, 15),
                 text_color=COLOR_TEXT,
                 fg_color=COLOR_PRIMARY,
                 hover_color=COLOR_PRIMARY_HOVER
-            ).grid(row=0, column=i, padx=5)
+            ).grid(row=0, column=i, padx=3)
 
         quick_row = ctk.CTkFrame(weekly_frame, fg_color="transparent")
         quick_row.pack()
@@ -9963,10 +9983,10 @@ class PrinterKioskApp:
             for code, var in day_vars.items():
                 var.set(1 if code in codes else 0)
 
-        self.secondary_button(quick_row, "매일", lambda: select_days(WEEKDAY_CODES), width=100, height=38, font_size=14).grid(row=0, column=0, padx=4)
-        self.secondary_button(quick_row, "평일", lambda: select_days(WEEKDAY_CODES[:5]), width=100, height=38, font_size=14).grid(row=0, column=1, padx=4)
-        self.secondary_button(quick_row, "주말", lambda: select_days(WEEKDAY_CODES[5:]), width=100, height=38, font_size=14).grid(row=0, column=2, padx=4)
-        self.secondary_button(quick_row, "해제", lambda: select_days([]), width=100, height=38, font_size=14).grid(row=0, column=3, padx=4)
+        self.secondary_button(quick_row, "매일", lambda: select_days(WEEKDAY_CODES), width=90, height=36, font_size=14).grid(row=0, column=0, padx=4)
+        self.secondary_button(quick_row, "평일", lambda: select_days(WEEKDAY_CODES[:5]), width=90, height=36, font_size=14).grid(row=0, column=1, padx=4)
+        self.secondary_button(quick_row, "주말", lambda: select_days(WEEKDAY_CODES[5:]), width=90, height=36, font_size=14).grid(row=0, column=2, padx=4)
+        self.secondary_button(quick_row, "해제", lambda: select_days([]), width=90, height=36, font_size=14).grid(row=0, column=3, padx=4)
 
         # 특정 날짜 선택 영역
         once_frame = ctk.CTkFrame(add_frame, fg_color="transparent")
@@ -10022,16 +10042,16 @@ class PrinterKioskApp:
 
         # 시각 입력 (공통)
         time_row = ctk.CTkFrame(add_frame, fg_color="transparent")
-        time_row.pack(pady=(14, 0))
+        time_row.pack(pady=(12, 0))
 
-        self.body_label(time_row, "종료 시각", size=15).grid(row=0, column=0, padx=10)
-        time_entry = self.make_entry(time_row, width=160, height=46, font_size=16)
-        time_entry.grid(row=0, column=1, padx=10)
+        self.body_label(time_row, "종료 시각", size=15).grid(row=0, column=0, padx=8)
+        time_entry = self.make_entry(time_row, width=140, height=44, font_size=16)
+        time_entry.grid(row=0, column=1, padx=8)
         time_entry.insert(0, "18:00")
 
         self.body_label(
             time_row, "24시간 형식 (예: 18:00)", size=13, muted=True
-        ).grid(row=0, column=2, padx=8)
+        ).grid(row=0, column=2, padx=6)
 
         def parse_time(text):
             match = re.fullmatch(r"(\d{1,2}):(\d{2})", text.strip())
@@ -10090,7 +10110,7 @@ class PrinterKioskApp:
                     "권한 확인 창에서 '예'를 눌렀는지 확인해 주세요."
                 )
 
-        self.primary_button(card, "일정 추가", add_schedule, width=200, height=48).pack(pady=(0, 18))
+        self.primary_button(right, "일정 추가", add_schedule, width=200, height=46).pack()
 
         # ── 삭제 버튼 ──
         def delete_selected():
@@ -10133,13 +10153,14 @@ class PrinterKioskApp:
             messagebox.showinfo("완료", "모든 일정을 삭제했습니다.")
             refresh_list()
 
-        del_frame = ctk.CTkFrame(card, fg_color="transparent")
-        del_frame.pack(pady=(0, 18))
+        # 삭제 버튼은 목록 바로 아래 (왼쪽 칸)
+        del_frame = ctk.CTkFrame(left, fg_color="transparent")
+        del_frame.pack()
 
-        self.danger_button(del_frame, "선택 일정 삭제", delete_selected, width=180, height=46).grid(row=0, column=0, padx=8)
-        self.secondary_button(del_frame, "전체 삭제", delete_all, width=180, height=46).grid(row=0, column=1, padx=8)
+        self.danger_button(del_frame, "선택 일정 삭제", delete_selected, width=170, height=46).grid(row=0, column=0, padx=6)
+        self.secondary_button(del_frame, "전체 삭제", delete_all, width=150, height=46).grid(row=0, column=1, padx=6)
 
-        self.link_button(card, "보호 기능 설정으로", self.kiosk_setting_screen, width=200, height=42).pack()
+        self.link_button(card, "보호 기능 설정으로", self.kiosk_setting_screen, width=200, height=42).pack(pady=(14, 0))
 
         refresh_list()
 
