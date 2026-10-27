@@ -99,7 +99,7 @@ DB_NAME = "school_printer.db"
 # 프로그램이 스스로 업데이트를 확인하는 일은 없다.
 # 관리자가 버튼을 눌렀을 때만 확인한다.
 # -----------------------------
-APP_VERSION = "1.6.6"
+APP_VERSION = "1.6.7"
 GITHUB_REPO = "sicgaonnury/printer"
 DEFAULT_ADMIN_PASSWORD = "1234"
 
@@ -224,6 +224,124 @@ def normalize_card_code(text):
     converted = "".join(hangul_syllable_to_eng_keys(ch) for ch in text)
     converted = converted.replace(" ", "")
     return converted.upper()
+
+
+# -----------------------------
+# 학번 입력 형식
+#
+#   "plain"  : 10101 처럼 적힌 그대로 쓴다. (기본값)
+#   "dashed" : 1-1-1 (학년-반-번호) 를 10101 로 바꿔서 쓴다.
+#              반 · 번호는 두 자리로 맞춘다.  2-10-5 → 21005
+#              10101 처럼 이미 다섯 자리로 적힌 것도 그대로 받는다.
+#
+# 엑셀에 1-1-1 을 치면 엑셀이 날짜(2001-01-01)로 바꿔 버린다.
+# 그래서 '형식 바꾸기' 모드에서는 날짜로 바뀐 칸도 학년-반-번호로 되돌려 읽는다.
+# -----------------------------
+STUDENT_NUMBER_FORMAT_KEY = "student_number_format"
+STUDENT_NUMBER_FORMATS = ("plain", "dashed")
+
+
+def get_student_number_format():
+    try:
+        value = get_setting(STUDENT_NUMBER_FORMAT_KEY, "plain")
+    except Exception:
+        value = "plain"
+    return value if value in STUDENT_NUMBER_FORMATS else "plain"
+
+
+def dashed_to_student_number(value):
+    """
+    학년-반-번호 를 10101 형식으로 바꾼다. 바꿀 수 없으면 None.
+
+      1-1-1, 1.1.1, 1/1/1, 1 1 1, 1학년 1반 1번  → 10101
+      2-10-25                                    → 21025
+      10101 (이미 다섯 자리)                      → 10101
+      엑셀이 날짜로 바꾼 2001-01-01 · datetime    → 10101
+    """
+    if value is None:
+        return None
+
+    if isinstance(value, (datetime, date)):
+        parts = [value.year, value.month, value.day]
+    elif isinstance(value, bool):
+        return None
+    elif isinstance(value, (int, float)):
+        if float(value) != int(value):
+            return None
+        text = str(int(value))
+        return text if len(text) == 5 else None
+    else:
+        text = str(value).strip()
+        if not text:
+            return None
+
+        # 엑셀 숫자 칸이 '10101.0' 으로 들어오는 경우
+        if re.fullmatch(r"\d{5}(\.0+)?", text):
+            return text[:5]
+
+        groups = re.findall(r"\d+", text)
+        if len(groups) != 3:
+            return None
+
+        # 숫자 말고 다른 글자가 섞였으면(학년 · 반 · 번 · 구분 기호 빼고) 학번이 아니다
+        leftover = re.sub(r"[\d\s\-./_·학년반번]", "", text)
+        if leftover:
+            return None
+
+        parts = [int(g) for g in groups]
+
+    grade, klass, number = parts
+
+    # 엑셀 날짜 2001-01-01 → 1학년 (연도 뒤 두 자리)
+    if 1900 <= grade <= 2099:
+        grade = grade % 100
+
+    if not (1 <= grade <= 9 and 1 <= klass <= 99 and 1 <= number <= 99):
+        return None
+
+    return f"{grade}{klass:02d}{number:02d}"
+
+
+def normalize_student_number(value, mode=None):
+    """
+    학번을 저장 · 조회에 쓰는 모양으로 다듬는다.
+
+    mode 가 없으면 관리자 설정(학번 입력 형식)을 따른다.
+    'dashed' 모드에서 학년-반-번호로 읽을 수 없는 값은 원래 값을 그대로 둔다.
+    """
+    if mode is None:
+        mode = get_student_number_format()
+
+    if value is None:
+        return ""
+
+    if mode == "dashed":
+        converted = dashed_to_student_number(value)
+        if converted:
+            return converted
+
+    # 엑셀 숫자 칸(10101 · 10101.0)은 모드와 상관없이 정수로 맞춘다
+    if isinstance(value, float) and not isinstance(value, bool) and value == int(value):
+        value = int(value)
+    elif isinstance(value, str) and re.fullmatch(r"\d+\.0+", value.strip()):
+        value = value.strip().split(".")[0]
+
+    return normalize_card_code(value)
+
+
+def student_number_needs_fix(value, mode=None):
+    """'dashed' 모드인데 학년-반-번호로 읽을 수 없는 값이면 True."""
+    if mode is None:
+        mode = get_student_number_format()
+
+    if mode != "dashed":
+        return False
+
+    text = "" if value is None else str(value).strip()
+    if not text:
+        return False
+
+    return dashed_to_student_number(value) is None
 
 
 # -----------------------------
@@ -654,6 +772,7 @@ SETTING_LABELS = {
     "admin_barcode": "메인 관리자 코드",
     "admin_mode": "관리자 방식",
     "idle_minutes": "자리 비움 복귀(분)",
+    "student_number_format": "학번 형식",
 }
 
 SECRET_SETTINGS = {"admin_password", "admin_barcode"}
@@ -662,6 +781,7 @@ _SETTING_VALUE_NAMES = {
     "limit_mode": {"count": "횟수", "pages": "용지 장수"},
     "delete_mode": {"time": "지우지 않음", "print": "바로 지움", "print_delay": "유예 후 지움"},
     "admin_mode": {"single": "단일 비밀번호", "individual": "관리자별 비밀번호"},
+    "student_number_format": {"plain": "10101 그대로", "dashed": "1-1-1 → 10101"},
     "fullscreen": {"0": "끔", "1": "켬"},
     "block_system_keys": {"0": "끔", "1": "켬"},
 }
@@ -995,6 +1115,8 @@ def sync_admin_csv(force=False):
     def cell(row, idx):
         return row[idx].strip() if 0 <= idx < len(row) else ""
 
+    number_mode = get_student_number_format()
+
     for row in rows[1:]:
         name = cell(row, i_name)
 
@@ -1008,7 +1130,11 @@ def sync_admin_csv(force=False):
         old_pw, old_code, _ = existing.get(name, ("", "", ""))
         pw_cell, code_cell = cell(row, i_pw), cell(row, i_code)
         note = cell(row, i_note)
-        profiles[name] = (cell(row, i_number), cell(row, i_title))
+        # 학번 입력 형식이 '1-1-1' 이면 관리자 명단의 학번도 10101 로 맞춘다
+        number_cell = cell(row, i_number)
+        if number_mode == "dashed":
+            number_cell = dashed_to_student_number(number_cell) or number_cell
+        profiles[name] = (number_cell, cell(row, i_title))
         roles[name] = ADMIN_ROLE_SUPER if cell(row, i_role) == ADMIN_ROLE_SUPER else ""
         seqs[name] = len(result) + 1
 
@@ -1393,13 +1519,14 @@ def get_student(card_code):
     row = cur.fetchone()
 
     if row is None:
+        # 학번 조회는 학번 입력 형식(1-1-1 → 10101)을 따른다
         cur.execute(
             """
             SELECT student_id, name, active, unlimited, created_date
             FROM students
             WHERE student_number=?
             """,
-            (normalized,)
+            (normalize_student_number(card_code),)
         )
         row = cur.fetchone()
 
@@ -1425,7 +1552,7 @@ def get_student_number(card_code):
 
 
 def get_student_by_number(student_number):
-    student_number = normalize_card_code(student_number)
+    student_number = normalize_student_number(student_number)
 
     conn = connect_db()
     cur = conn.cursor()
@@ -2485,6 +2612,10 @@ def read_xlsx_rows(path):
     return rows
 
 
+# 마지막 불러오기에서 학번 형식을 바꾸지 못한 값들 (안내 창에 보여 주려고 남겨 둔다)
+_last_import_info = {"unconverted": []}
+
+
 def import_users_from_file(path):
     ext = os.path.splitext(path)[1].lower()
 
@@ -2532,6 +2663,9 @@ def import_users_from_file(path):
 
     imported = 0
     skipped = 0
+    number_mode = get_student_number_format()
+    unconverted = []          # '1-1-1 형식' 모드인데 학번으로 읽지 못한 값
+    _last_import_info["unconverted"] = unconverted
 
     for row in rows[1:]:
         try:
@@ -2552,7 +2686,9 @@ def import_users_from_file(path):
                 active = parse_bool(row[active_idx], default=1)
 
             code = normalize_card_code(code)
-            number = normalize_card_code(number)
+            if student_number_needs_fix(number, number_mode):
+                unconverted.append(str(number).strip())
+            number = normalize_student_number(number, number_mode)
             name = str(name).strip()
 
             if not code or not name:
@@ -8026,7 +8162,8 @@ class PrinterKioskApp:
         search_frame.pack(pady=(0, 6))
 
         self.body_label(search_frame, "학생증 코드", size=17, bold=True).grid(row=0, column=0, padx=(0, 10))
-        search_entry = self.make_entry(search_frame, width=260, height=44, font_size=15, justify="left")
+        # 오른쪽에 '학번 형식' 전환이 붙으므로 표(960px)보다 넓어지지 않게 조금 줄인다
+        search_entry = self.make_entry(search_frame, width=210, height=44, font_size=15, justify="left")
         search_entry.grid(row=0, column=1, padx=6)
 
         tree = ttk.Treeview(
@@ -8091,7 +8228,14 @@ class PrinterKioskApp:
                 )
 
         def search_students():
-            keyword = normalize_card_code(search_entry.get())
+            raw = search_entry.get()
+            keyword = normalize_card_code(raw)
+            # '1-1-1' 형식 모드에서 1-1-1 로 찾으면 10101 로 바꿔서 찾는다
+            # (101 처럼 일부만 넣은 검색은 그대로 둔다)
+            if get_student_number_format() == "dashed":
+                converted = dashed_to_student_number(raw)
+                if converted:
+                    keyword = converted
             refresh_users(keyword if keyword else None)
 
         def show_all_students():
@@ -8100,6 +8244,53 @@ class PrinterKioskApp:
 
         self.secondary_button(search_frame, "검색", search_students, width=100, height=40, font_size=16).grid(row=0, column=2, padx=6)
         self.secondary_button(search_frame, "전체 보기", show_all_students, width=100, height=40, font_size=16).grid(row=0, column=3, padx=6)
+
+        # ── 학번 입력 형식 ─────────────────────────────
+        #   10101   : 적힌 그대로
+        #   1-1-1   : 학년-반-번호 를 10101 로 바꿔서 저장 · 조회
+        # 직접 입력, CSV/XLSX 불러오기, 연동 CSV, 학번 검색에 모두 적용된다.
+        FORMAT_LABELS = {"plain": "10101 그대로", "dashed": "1-1-1 → 10101"}
+        FORMAT_KEYS = {v: k for k, v in FORMAT_LABELS.items()}
+
+        self.body_label(search_frame, "학번 형식", size=15, bold=True).grid(row=0, column=4, padx=(22, 8))
+
+        def apply_number_placeholder(mode):
+            hint = "예) 1-1-1" if mode == "dashed" else "예) 10101"
+            try:
+                number_entry.configure(placeholder_text=hint)
+                # 이미 글자가 들어 있으면 placeholder 가 보이지 않으므로 비어 있을 때만 다시 그린다
+                if not number_entry.get():
+                    number_entry._activate_placeholder()
+            except Exception:
+                pass
+
+        def on_format_change(label):
+            mode = FORMAT_KEYS.get(label, "plain")
+            if mode == get_student_number_format():
+                return
+            # 작업 기록은 set_setting 이 '설정 변경 · 학번 형식: … → …' 으로 남긴다
+            set_setting(STUDENT_NUMBER_FORMAT_KEY, mode)
+            apply_number_placeholder(mode)
+
+        # 회색 바탕 위에 고른 쪽만 흰색으로 떠 보이게 한다
+        format_switch = ctk.CTkSegmentedButton(
+            search_frame,
+            values=[FORMAT_LABELS["plain"], FORMAT_LABELS["dashed"]],
+            command=on_format_change,
+            height=40,
+            corner_radius=10,
+            border_width=3,
+            font=(self.font_family, 14, "bold"),
+            fg_color=COLOR_SECONDARY_BG,
+            selected_color=COLOR_CARD,
+            selected_hover_color=COLOR_CARD,
+            unselected_color=COLOR_SECONDARY_BG,
+            unselected_hover_color=COLOR_SECONDARY_BG_HOVER,
+            text_color=COLOR_TEXT,
+        )
+        format_switch.grid(row=0, column=5, padx=(0, 4))
+        format_switch.set(FORMAT_LABELS[get_student_number_format()])
+        apply_number_placeholder(get_student_number_format())
 
         tree.pack(pady=(0, 6))
 
@@ -8125,12 +8316,22 @@ class PrinterKioskApp:
 
         def save_user():
             card_code = normalize_card_code(card_entry.get())
-            student_number = normalize_card_code(number_entry.get())
+            raw_number = number_entry.get()
+            student_number = normalize_student_number(raw_number)
             name = name_entry.get().strip()
             unlimited = unlimited_var.get()
 
             if not card_code or not name:
                 messagebox.showwarning("입력 오류", "학생증 코드와 이름을 입력하세요.")
+                return
+
+            if student_number_needs_fix(raw_number):
+                messagebox.showwarning(
+                    "학번 형식",
+                    f"'{raw_number.strip()}' 을(를) 학번으로 읽지 못했습니다.\n\n"
+                    "지금은 '1-1-1 → 10101' 형식입니다.\n"
+                    "학년-반-번호 (예: 1-1-1, 2-10-25) 또는 10101 처럼 입력하세요."
+                )
                 return
 
             try:
@@ -8255,10 +8456,20 @@ class PrinterKioskApp:
             try:
                 imported, skipped = import_users_from_file(path)
                 admin_log("이용자 명단 불러오기", f"{os.path.basename(path)} · {imported}명 반영, {skipped}줄 건너뜀")
-                messagebox.showinfo(
-                    "불러오기 완료",
-                    f"불러온 이용자: {imported}명\n건너뛴 행: {skipped}개"
-                )
+
+                message = f"불러온 이용자: {imported}명\n건너뛴 행: {skipped}개"
+
+                # '1-1-1' 형식 모드에서 학번으로 읽지 못한 값은 그대로 저장했음을 알린다
+                unconverted = _last_import_info.get("unconverted") or []
+                if unconverted:
+                    sample = ", ".join(unconverted[:5]) + (" …" if len(unconverted) > 5 else "")
+                    message += (
+                        f"\n\n학번을 10101 형식으로 바꾸지 못한 행: {len(unconverted)}개\n"
+                        f"({sample})\n"
+                        "이 행들은 적힌 그대로 저장했습니다. 명단에서 학번을 확인하세요."
+                    )
+
+                messagebox.showinfo("불러오기 완료", message)
                 write_sync_csv()
                 refresh_users()
 
