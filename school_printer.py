@@ -99,7 +99,7 @@ DB_NAME = "school_printer.db"
 # 프로그램이 스스로 업데이트를 확인하는 일은 없다.
 # 관리자가 버튼을 눌렀을 때만 확인한다.
 # -----------------------------
-APP_VERSION = "1.6.7"
+APP_VERSION = "1.6.8"
 GITHUB_REPO = "sicgaonnury/printer"
 DEFAULT_ADMIN_PASSWORD = "1234"
 
@@ -888,8 +888,8 @@ def export_admin_logs_to_csv(path, actor=None):
 #
 # 프로그램 폴더의 admin_list.csv 에 관리자를 적는다.
 #   이름 · 학번 · 직함 · 권한 · 관리자코드 · 비밀번호 · 비고
-#   '권한' 칸에 '총괄' 이라고 적은 사람만 비밀번호 설정 · 관리자 계정 · 작업 기록을
-#   쓸 수 있다. 아무도 적지 않으면 맨 윗줄 사람(= 카드 01)이 총괄이 된다.
+#   '권한' 칸에 '총괄' 이라고 적은 사람은 모두(여러 명 가능) 비밀번호 설정 ·
+#   관리자 계정 · 작업 기록을 쓸 수 있다. 아무도 적지 않으면 맨 윗줄 사람(= 카드 01)이 총괄이 된다.
 #   (학번 · 직함은 관리자 화면 위쪽에 '학번 이름 (직함)' 으로 표시된다. 비워도 된다)
 #
 # 비밀번호와 관리자코드는 파일에 오래 두면 안 되므로, 프로그램이 읽는 즉시
@@ -903,7 +903,7 @@ ADMIN_CSV_NAME = "admin_list.csv"
 ADMIN_CSV_HEADER = ["이름", "학번", "직함", "권한", "관리자코드", "비밀번호", "비고"]
 REGISTERED_MARK = "(등록됨)"
 
-# 비밀번호 설정 · 관리자 계정 · 작업 기록은 '총괄' 한 사람만 쓸 수 있다.
+# 비밀번호 설정 · 관리자 계정 · 작업 기록은 '총괄' 로 적힌 사람들만 쓸 수 있다.
 ADMIN_ROLE_SUPER = "총괄"
 
 # 명단이 비어 있을 때만 쓰이는 비상 통로. 이 이름들은 총괄로 본다.
@@ -985,25 +985,49 @@ def list_admin_roles():
     return rows
 
 
-def super_admin_name():
+def super_admin_names():
     """
-    총괄 관리자 한 사람의 이름.
+    총괄 관리자 이름들 (명단 순서대로).
 
-    명단의 '권한' 칸에 '총괄' 이라고 적힌 사람이 있으면 그 사람
-    (여럿이면 명단에서 먼저 나온 사람),
-    아무도 적혀 있지 않으면 명단 맨 윗줄 사람(= 카드 01)을 총괄로 본다.
+    명단의 '권한' 칸에 '총괄' 이라고 적힌 사람은 모두 총괄이다. 몇 명이든 된다.
+    아무도 적혀 있지 않으면 명단 맨 윗줄 사람(= 카드 01) 한 명을 총괄로 본다.
     """
     roles = list_admin_roles()
 
     if not roles:
-        return ""
+        return []
 
-    marked = [(seq, name) for name, (role, seq) in roles.items() if role == ADMIN_ROLE_SUPER]
+    marked = sorted((seq, name) for name, (role, seq) in roles.items() if role == ADMIN_ROLE_SUPER)
 
     if marked:
-        return min(marked)[1]
+        return [name for _, name in marked]
 
-    return min((seq, name) for name, (role, seq) in roles.items())[1]
+    return [min((seq, name) for name, (role, seq) in roles.items())[1]]
+
+
+def super_admin_name():
+    """총괄 중 명단에서 가장 먼저 나온 사람. (예전 코드와의 호환용)"""
+    names = super_admin_names()
+    return names[0] if names else ""
+
+
+def describe_super_admins(limit=3):
+    """
+    화면 안내용 총괄 목록.  예) '20101 김회장 (학생회장), 20102 이부회 (학생부회장)'
+    많으면 앞의 몇 명만 보이고 '외 N명' 을 붙인다.
+    """
+    names = super_admin_names()
+
+    if not names:
+        return ""
+
+    shown = [describe_admin(n) or n for n in names[:limit]]
+    text = ", ".join(shown)
+
+    if len(names) > limit:
+        text += f" 외 {len(names) - limit}명"
+
+    return text
 
 
 def is_super_admin(name):
@@ -1014,8 +1038,8 @@ def is_super_admin(name):
     if name in FALLBACK_ADMIN_NAMES:
         return True
 
-    top = super_admin_name()
-    return (not top) or (name == top)
+    names = super_admin_names()
+    return (not names) or (name in names)
 
 
 def admin_can_manage(name=None):
@@ -1023,7 +1047,7 @@ def admin_can_manage(name=None):
     총괄 전용 기능(비밀번호 설정 · 관리자 계정 · 작업 기록)을 쓸 수 있는지.
 
     단일 방식은 비밀번호가 하나뿐이라 누가 들어왔는지 가릴 수 없으므로 막지 않는다.
-    개별 방식에서만 총괄 한 사람으로 제한한다.
+    개별 방식에서만 '총괄' 로 적힌 사람들로 제한한다.
     """
     if get_admin_mode() != "individual":
         return True
@@ -1135,7 +1159,8 @@ def sync_admin_csv(force=False):
         if number_mode == "dashed":
             number_cell = dashed_to_student_number(number_cell) or number_cell
         profiles[name] = (number_cell, cell(row, i_title))
-        roles[name] = ADMIN_ROLE_SUPER if cell(row, i_role) == ADMIN_ROLE_SUPER else ""
+        # '총괄', ' 총괄 ', '총 괄' 모두 총괄로 본다. 몇 명이 적혀 있어도 된다.
+        roles[name] = ADMIN_ROLE_SUPER if cell(row, i_role).replace(" ", "") == ADMIN_ROLE_SUPER else ""
         seqs[name] = len(result) + 1
 
         # 비밀번호
@@ -8050,7 +8075,7 @@ class PrinterKioskApp:
         if admin_can_manage():
             return True
 
-        top = describe_admin(super_admin_name()) or super_admin_name()
+        top = describe_super_admins(limit=6)
 
         admin_log("권한 없음", "총괄 전용 기능에 접근 시도")
         messagebox.showwarning(
@@ -8079,7 +8104,7 @@ class PrinterKioskApp:
         ).pack(pady=(0, 4 if not can_manage else 14))
 
         if not can_manage:
-            top = describe_admin(super_admin_name()) or super_admin_name()
+            top = describe_super_admins(limit=2)
             self.body_label(
                 card,
                 "비밀번호 설정 · 관리자 계정 · 작업 기록은 총괄 관리자만 쓸 수 있습니다"
@@ -9681,10 +9706,10 @@ class PrinterKioskApp:
             size=13, muted=True
         ).pack(pady=(0, 4))
 
-        top_admin = describe_admin(super_admin_name()) or super_admin_name()
+        top_admin = describe_super_admins(limit=3)
         self.body_label(
             right,
-            "'권한' 칸에 '총괄' 이라고 적은 사람만 이 화면과 비밀번호 설정을 쓸 수 있습니다"
+            "'권한' 칸에 '총괄' 이라고 적은 사람만 이 화면과 비밀번호 설정을 쓸 수 있습니다 (여러 명 가능)"
             + (f"\n지금 총괄: {top_admin}" if top_admin else "\n아직 총괄이 정해지지 않았습니다 (명단 맨 윗줄이 총괄이 됩니다)"),
             size=13, muted=True
         ).pack(pady=(0, 8))
@@ -9718,9 +9743,13 @@ class PrinterKioskApp:
                 tree.delete(row)
 
             profiles = list_admin_profiles()
+            supers = set(super_admin_names())
 
             for name, pw_hash, code_hash, note in list_admins():
                 number, title = profiles.get(name, ("", ""))
+                # 총괄은 직함 칸에 함께 표시한다 (여러 명이어도 한눈에 보이게)
+                if name in supers:
+                    title = f"{title} · 총괄" if title else "총괄"
                 tree.insert("", "end", values=(
                     number,
                     name,
