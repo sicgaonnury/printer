@@ -245,7 +245,7 @@ td.act{white-space:nowrap;}
               <th style="width:96px">학번</th>
               <th style="width:92px">이름</th>
               <th style="width:150px">직함</th>
-              <th style="width:58px" title="비밀번호 설정 · 관리자 계정 · 작업 기록을 쓸 수 있는 한 사람">총괄</th>
+              <th style="width:58px" title="비밀번호 설정 · 관리자 계정 · 작업 기록을 쓸 수 있는 사람 (여러 명 가능)">총괄</th>
               <th style="width:168px">관리자 코드</th>
               <th style="width:206px">비밀번호</th>
               <th style="width:74px"></th>
@@ -266,7 +266,8 @@ td.act{white-space:nowrap;}
         회장 · 부회장처럼 권한이 큰 자리는 체크를 풀어 따로 정하세요.
         체크를 풀면 카드에는 코드만 인쇄되고, 비밀번호는 CSV에만 남습니다.
         <br><br>
-        <b>총괄</b>로 고른 한 사람만 프로그램에서 <b>비밀번호 설정 · 관리자 계정 · 작업 기록</b>을 쓸 수 있습니다.
+        <b>총괄</b>에 체크한 사람만 프로그램에서 <b>비밀번호 설정 · 관리자 계정 · 작업 기록</b>을 쓸 수 있습니다.
+        여러 명 체크해도 되고, 아무도 체크하지 않으면 맨 윗줄(카드 01)이 총괄이 됩니다.
         나머지는 이용자 관리 · 출력 설정 같은 평소 업무만 할 수 있습니다.
       </div>
 
@@ -748,16 +749,15 @@ function renderRows(){
     tr.appendChild(inputCell(r, 'name', '홍길동', ''));
     tr.appendChild(inputCell(r, 'role', '친교부 부장', ''));
 
-    // 총괄 (한 사람만)
+    // 총괄 (여러 명 가능 · 아무도 없으면 맨 윗줄이 총괄)
     var tdch = el('td', 'chief');
     tdch.style.textAlign = 'center';
     var rb = document.createElement('input');
-    rb.type = 'radio'; rb.name = 'chief'; rb.checked = !!r.chief;
-    rb.title = '비밀번호 설정 · 관리자 계정 · 작업 기록을 쓸 수 있는 한 사람';
+    rb.type = 'checkbox'; rb.checked = !!r.chief;
+    rb.title = '비밀번호 설정 · 관리자 계정 · 작업 기록을 쓸 수 있는 사람 (여러 명 가능)';
     rb.style.cssText = 'width:17px;height:17px;accent-color:var(--accent);cursor:pointer;';
     rb.addEventListener('change', function(){
-      state.rows.forEach(function(x){ x.chief = false; });
-      r.chief = true;
+      r.chief = rb.checked;
       commit();
     });
     tdch.appendChild(rb);
@@ -923,7 +923,7 @@ function toCsv(){
   var lines = [head.map(q).join(',')];
   state.rows.forEach(function(r, i){
     var note = '카드 ' + pad2(i + 1) + (r.samePw ? '' : '  (비밀번호 별도 — 카드에 인쇄 안 됨)');
-    // 총괄 한 사람만 비밀번호 설정 · 관리자 계정 · 작업 기록을 쓸 수 있다
+    // '총괄' 로 적힌 사람(여러 명 가능)만 비밀번호 설정 · 관리자 계정 · 작업 기록을 쓸 수 있다
     lines.push([r.name, r.sid, r.role, (r.chief ? '총괄' : ''), r.code, effPw(r), note].map(q).join(','));
   });
   return '﻿' + lines.join('\r\n') + '\r\n';
@@ -968,7 +968,7 @@ function fromCsv(text){
       name:(r[idx['이름']] || '').trim(),
       sid:(r[idx['학번']] || '').trim(),
       role:(r[idx['직함']] || '').trim(),
-      chief: ((r[idx['권한']] || '').trim() === '총괄'),
+      chief: ((r[idx['권한']] || '').replace(/\s/g, '') === '총괄'),
       code: code, pw: pw,
       samePw: (!pw || pw === code)
     };
@@ -986,10 +986,10 @@ function download(name, text){
 /* ---------------- 반영 ---------------- */
 function ensureChief(){
   if (!state.rows.length) return;
+  // 총괄은 여러 명이어도 된다. 한 명도 없을 때만 맨 윗줄을 총괄로 정한다 (프로그램과 같은 규칙)
   var marked = state.rows.filter(function(r){ return r.chief; });
-  if (marked.length === 1) return;
-  state.rows.forEach(function(r){ r.chief = false; });
-  (marked[0] || state.rows[0]).chief = true;
+  if (marked.length) return;
+  state.rows[0].chief = true;
 }
 function commit(){
   ensureChief();
