@@ -99,7 +99,7 @@ DB_NAME = "school_printer.db"
 # 프로그램이 스스로 업데이트를 확인하는 일은 없다.
 # 관리자가 버튼을 눌렀을 때만 확인한다.
 # -----------------------------
-APP_VERSION = "1.6.9"
+APP_VERSION = "1.6.10"
 GITHUB_REPO = "sicgaonnury/printer"
 DEFAULT_ADMIN_PASSWORD = "1234"
 
@@ -3042,6 +3042,10 @@ COLOR_PRIMARY_SOFT = "#EAF1FE"  # 포인트 컬러의 옅은 배경(뱃지 등)
 COLOR_SECONDARY_BG = "#EEF0F3"  # 보조 버튼 배경
 COLOR_SECONDARY_BG_HOVER = "#E1E4E9"
 COLOR_SECONDARY_TEXT = "#3A3F47"
+# 첫 화면 USB 안내 (진한 남색 바탕 · 흰 글자 — 파란 '학생증 스캔' 상자와 구분되게)
+COLOR_USB_NOTICE_BG   = "#1C2340"
+COLOR_USB_NOTICE_TEXT = "#FFFFFF"
+COLOR_USB_NOTICE_SUB  = "#C9D1EA"
 # 고장 신고 안내 배너 (연한 붉은색)
 COLOR_REPORT_BANNER_BG   = "#FDECEC"
 COLOR_REPORT_BANNER_LINE = "#F3BEBE"
@@ -3993,21 +3997,101 @@ def is_running_as_admin():
         return False
 
 
+# -----------------------------
+# 관리자 권한(UAC) 요청을 화면 앞에 띄우기 위한 연결 고리
+#
+# 이 프로그램은 전체화면 + 항상 위(topmost) 로 떠 있다. 학교 PC 처럼 UAC 의
+# '보안 데스크톱(화면 어둡게)' 이 꺼져 있으면 UAC 창이 일반 창으로 뜨는데,
+# 그러면 항상-위 창인 이 프로그램 뒤에 깔려 보이지 않는다. 게다가 예전에는
+# UAC 창이 떠 있는 동안 화면 스레드가 멈춰서 Windows 가 '응답 없음' 창을
+# 덧씌웠다. 그래서 프로그램 쪽(App)이 아래 고리를 채워 두면
+#   · UAC 를 띄우기 전에 항상-위를 잠시 풀고 (before)
+#   · UAC 창의 주인 창을 이 프로그램 창으로 지정하고 (owner)
+#   · 기다리는 동안 화면이 멈추지 않게 이벤트를 처리하고 (pump)
+#   · 끝나면 원래대로 돌려 놓는다 (after)
+# -----------------------------
+_ELEVATION_HOOKS = {"owner": None, "before": None, "after": None, "pump": None}
+
+
+def set_elevation_hooks(owner=None, before=None, after=None, pump=None):
+    _ELEVATION_HOOKS.update(owner=owner, before=before, after=after, pump=pump)
+
+
+def _call_hook(name, *args):
+    hook = _ELEVATION_HOOKS.get(name)
+    if hook is None:
+        return None
+    try:
+        return hook(*args)
+    except Exception:
+        return None
+
+
 def _run_elevated_and_wait(command, timeout=120):
     """
     관리자 권한으로 명령을 실행하고 끝날 때까지 기다린다. (UAC 창이 뜬다)
 
-    ShellExecuteW 로 던지기만 하면 성공했는지 알 수 없어서, 여기서는
-    ShellExecuteEx 로 프로세스 손잡이를 받아 종료 코드까지 확인한다.
+    화면 스레드에서 불리면 UAC 요청과 기다리기를 별도 스레드에서 처리하고,
+    그동안 화면은 계속 움직이게 둔다. (위 '연결 고리' 설명 참고)
     돌려주는 값은 (성공여부, 안내문).
+    """
+    on_main = threading.current_thread() is threading.main_thread()
+    owner = _call_hook("owner") if on_main else None
+
+    if on_main:
+        _call_hook("before")
+
+    try:
+        if on_main and _ELEVATION_HOOKS.get("pump") is not None:
+            box = {}
+
+            def worker():
+                box["result"] = _shell_execute_elevated(command, timeout, owner)
+
+            thread = threading.Thread(target=worker, daemon=True)
+            thread.start()
+
+            while thread.is_alive():
+                _call_hook("pump")
+                thread.join(0.05)
+
+            return box.get("result") or (False, "명령을 실행하지 못했습니다.")
+
+        return _shell_execute_elevated(command, timeout, owner)
+
+    finally:
+        if on_main:
+            _call_hook("after")
+
+
+def _shell_execute_elevated(command, timeout, owner_hwnd=None):
+    """
+    ShellExecuteEx(runas) 로 명령을 관리자 권한으로 실행하고 종료 코드까지 확인한다.
+    ShellExecuteW 로 던지기만 하면 성공했는지 알 수 없어서 프로세스 손잡이를 받는다.
     """
     import ctypes
     import ctypes.wintypes as wt
 
     SEE_MASK_NOCLOSEPROCESS = 0x00000040
+    SEE_MASK_NOASYNC = 0x00000100
     SEE_MASK_NO_CONSOLE = 0x00008000
     SW_HIDE = 0
     ERROR_CANCELLED = 1223
+    ASFW_ANY = -1
+
+    # 다른 스레드에서 ShellExecuteEx 를 쓸 때는 COM 을 먼저 준비해야 한다
+    try:
+        ctypes.windll.ole32.CoInitializeEx(None, 0x2 | 0x4)   # APARTMENTTHREADED | DISABLE_OLE1DDE
+    except Exception:
+        pass
+
+    # UAC 창(consent.exe)이 포그라운드를 가져갈 수 있게 허락한다
+    try:
+        ctypes.windll.user32.AllowSetForegroundWindow(ASFW_ANY)
+    except Exception:
+        pass
+
+    shell32 = ctypes.WinDLL("shell32", use_last_error=True)
 
     class SHELLEXECUTEINFOW(ctypes.Structure):
         _fields_ = [
@@ -4030,26 +4114,35 @@ def _run_elevated_and_wait(command, timeout=120):
 
     info = SHELLEXECUTEINFOW()
     info.cbSize = ctypes.sizeof(info)
-    info.fMask = SEE_MASK_NOCLOSEPROCESS | SEE_MASK_NO_CONSOLE
+    info.fMask = SEE_MASK_NOCLOSEPROCESS | SEE_MASK_NOASYNC | SEE_MASK_NO_CONSOLE
+    info.hwnd = owner_hwnd or None          # UAC 창이 이 프로그램 창 앞에 뜨도록 주인 창 지정
     info.lpVerb = "runas"
     info.lpFile = "cmd.exe"
     info.lpParameters = f"/c {command}"
     info.nShow = SW_HIDE
 
+    shell32.ShellExecuteExW.argtypes = [ctypes.POINTER(SHELLEXECUTEINFOW)]
+    shell32.ShellExecuteExW.restype = wt.BOOL
+
     try:
-        ok = ctypes.windll.shell32.ShellExecuteExW(ctypes.byref(info))
+        ok = shell32.ShellExecuteExW(ctypes.byref(info))
     except Exception as e:
         return False, f"명령을 실행하지 못했습니다.\n{e}"
 
     if not ok or not info.hProcess:
-        code = ctypes.GetLastError()
+        code = ctypes.get_last_error()
 
         if code == ERROR_CANCELLED:
             return False, "관리자 권한 요청이 거부되었습니다."
 
         return False, f"명령을 실행하지 못했습니다. (코드 {code})"
 
-    kernel32 = ctypes.windll.kernel32
+    # 64비트에서 손잡이 값이 잘리지 않도록 인자 형식을 정해 둔다 (전역 windll 은 건드리지 않음)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.WaitForSingleObject.argtypes = [wt.HANDLE, wt.DWORD]
+    kernel32.WaitForSingleObject.restype = wt.DWORD
+    kernel32.GetExitCodeProcess.argtypes = [wt.HANDLE, ctypes.POINTER(wt.DWORD)]
+    kernel32.CloseHandle.argtypes = [wt.HANDLE]
 
     try:
         wait_result = kernel32.WaitForSingleObject(info.hProcess, int(timeout * 1000))
@@ -5012,6 +5105,9 @@ class PrinterKioskApp:
         self.fullscreen = get_setting("fullscreen", "1") == "1"
         self.apply_fullscreen()
 
+        # 관리자 권한(UAC) 창이 이 프로그램 뒤에 깔리지 않도록 연결해 둔다
+        self._setup_elevation_hooks()
+
         self.root.protocol("WM_DELETE_WINDOW", self.block_close)
         self.bind_blocked_shortcuts()
         self.setup_scanner_focus()
@@ -5252,7 +5348,8 @@ class PrinterKioskApp:
         big = (getattr(self, "current_screen", "") == "start")
 
         if big:
-            place_args = {"relx": 0.5, "rely": 0.75, "anchor": "n"}
+            # 첫 화면은 위에 USB 안내가 들어가 카드가 조금 길어졌으므로 살짝 내린다
+            place_args = {"relx": 0.5, "rely": 0.77, "anchor": "n"}
             head_size, detail_size = 30, 19
             pad_x, pad_y = 40, 22
             btn_width, btn_height, btn_font = 130, 52, 17
@@ -5460,6 +5557,112 @@ class PrinterKioskApp:
 
         self.root.update_idletasks()
 
+    def _window_handle(self, widget=None):
+        """Tk 창의 실제 Windows 창 손잡이(HWND). 못 구하면 None."""
+        widget = widget or self.root
+        try:
+            return int(widget.wm_frame(), 16) or None
+        except Exception:
+            try:
+                import ctypes
+                return ctypes.windll.user32.GetParent(widget.winfo_id()) or None
+            except Exception:
+                return None
+
+    def _setup_elevation_hooks(self):
+        """
+        관리자 권한(UAC) 요청 앞뒤로 할 일을 연결한다. (_run_elevated_and_wait 참고)
+
+          before : 항상-위를 잠시 풀고, '확인 창에서 예를 누르세요' 안내를 띄운다
+          pump   : 기다리는 동안 화면이 멈추지 않게 한다 (안내 창이 입력을 막아 둔다)
+          after  : 안내를 닫고 전체화면 항상-위를 되돌린다
+        """
+        self._elevation_wait = None
+
+        def before():
+            # 이 프로그램이 항상-위로 떠 있으면 UAC 창이 뒤에 깔린다
+            try:
+                self.root.attributes("-topmost", False)
+            except Exception:
+                pass
+
+            for name in ("_close_overlay", "_auto_delete_overlay"):
+                overlay = getattr(self, name, None)
+                if overlay is not None:
+                    try:
+                        overlay.attributes("-topmost", False)
+                    except Exception:
+                        pass
+
+            # 기다리는 동안 다른 버튼을 누르지 못하게 하는 작은 안내 창
+            try:
+                wait = ctk.CTkToplevel(self.root)
+                wait.overrideredirect(True)
+                wait.configure(fg_color=COLOR_CARD)
+                w, h = 520, 150
+                sw, sh = wait.winfo_screenwidth(), wait.winfo_screenheight()
+                wait.geometry(f"{w}x{h}+{(sw - w) // 2}+{int(sh * 0.12)}")
+
+                frame = ctk.CTkFrame(wait, fg_color=COLOR_CARD, border_color=COLOR_PRIMARY,
+                                     border_width=2, corner_radius=16)
+                frame.pack(fill="both", expand=True)
+                ctk.CTkLabel(
+                    frame, text="관리자 권한을 확인하는 중입니다",
+                    font=(self.font_family, 20, "bold"), text_color=COLOR_TEXT
+                ).pack(pady=(28, 6))
+                ctk.CTkLabel(
+                    frame, text="화면에 뜬 Windows 확인 창에서 '예' 를 눌러 주세요.",
+                    font=(self.font_family, 15), text_color=COLOR_TEXT_MUTED
+                ).pack()
+
+                wait.update_idletasks()
+                wait.grab_set()
+                self._elevation_wait = wait
+            except Exception:
+                self._elevation_wait = None
+
+            try:
+                self.root.update()
+            except Exception:
+                pass
+
+        def pump():
+            self.root.update()
+
+        def after():
+            wait = getattr(self, "_elevation_wait", None)
+            self._elevation_wait = None
+            if wait is not None:
+                try:
+                    wait.grab_release()
+                    wait.destroy()
+                except Exception:
+                    pass
+
+            for name in ("_close_overlay", "_auto_delete_overlay"):
+                overlay = getattr(self, name, None)
+                if overlay is not None:
+                    try:
+                        overlay.attributes("-topmost", True)
+                    except Exception:
+                        pass
+
+            # 키오스크 브라우저가 떠 있을 때는 프로그램을 앞으로 끌어오지 않는다
+            if self.fullscreen and not self.external_browser_open:
+                try:
+                    self.root.attributes("-topmost", True)
+                    self.root.lift()
+                    self.root.focus_force()
+                except Exception:
+                    pass
+
+        set_elevation_hooks(
+            owner=lambda: self._window_handle(),
+            before=before,
+            after=after,
+            pump=pump,
+        )
+
     def bind_blocked_shortcuts(self):
         """
         프로그램 창 안에서 창을 벗어나게 하는 키 조합을 막는다.
@@ -5548,6 +5751,7 @@ class PrinterKioskApp:
             getattr(self, "_close_overlay", None),
             getattr(self, "_auto_delete_overlay", None),
             getattr(self, "_report_banner", None),
+            getattr(self, "_elevation_wait", None),     # 관리자 권한 확인 안내 창
         )
 
         for widget in self.root.winfo_children():
@@ -5778,6 +5982,30 @@ class PrinterKioskApp:
         card = self.build_card()
         self.make_title(card, "서인천고등학교 공용 프린터 제어 시스템")
 
+        # ── USB 안내 (크게) ──
+        # 학교 와이파이에 학생 기기가 붙지 않아 파일 공유를 쓸 수 없는 경우가 많다.
+        # 그래서 USB 로 가져오는 방법을 첫 화면에서 가장 먼저 보이게 한다.
+        # (파일 공유 기능은 그대로 두고 오른쪽 아래 버튼으로 계속 쓸 수 있다)
+        usb_box = ctk.CTkFrame(card, fg_color=COLOR_USB_NOTICE_BG, corner_radius=18)
+        usb_box.pack(fill="x", pady=(0, 18))
+
+        usb_inner = ctk.CTkFrame(usb_box, fg_color="transparent")
+        usb_inner.pack(padx=34, pady=(16, 18))
+
+        ctk.CTkLabel(
+            usb_inner,
+            text="인쇄하려면 USB를 연결하세요",
+            font=(self.font_family, 34, "bold"),
+            text_color=COLOR_USB_NOTICE_TEXT
+        ).pack()
+
+        ctk.CTkLabel(
+            usb_inner,
+            text="출력할 파일을 USB에 담아 와서 컴퓨터에 꽂은 뒤, 학생증을 찍으세요.",
+            font=(self.font_family, 18),
+            text_color=COLOR_USB_NOTICE_SUB
+        ).pack(pady=(6, 0))
+
         # 입력 영역을 한데 묶어 가운데에 둔다.
         row = ctk.CTkFrame(card, fg_color="transparent")
         row.pack(pady=(0, 4))
@@ -5788,7 +6016,7 @@ class PrinterKioskApp:
         # 이 상자를 누르면 고장 신고 상태를 바로 다시 확인한다.
         # (학생이 신고한 직후 안내가 아직 안 떴을 때 눌러보게 된다)
         badge = ctk.CTkFrame(left, fg_color=COLOR_PRIMARY_SOFT, corner_radius=14)
-        badge.pack(pady=(0, 28))
+        badge.pack(pady=(0, 18))
 
         badge_label = ctk.CTkLabel(
             badge,
@@ -5796,14 +6024,14 @@ class PrinterKioskApp:
             font=(self.font_family, 26, "bold"),
             text_color=COLOR_PRIMARY
         )
-        badge_label.pack(padx=28, pady=20)
+        badge_label.pack(padx=28, pady=16)
 
         for widget in (badge, badge_label):
             widget.bind("<Button-1>", lambda event: self.refresh_report_status())
             widget.configure(cursor="hand2")
 
         self.card_entry = self.make_entry(left, width=460, height=60, font_size=28)
-        self.card_entry.pack(pady=(0, 24))
+        self.card_entry.pack(pady=(0, 18))
         self.card_entry.bind("<Return>", lambda event: self.check_user())
 
         # 학생증 코드(5자리)보다 길게 입력되면 관리자코드일 수 있으므로 가린다.
@@ -5817,13 +6045,18 @@ class PrinterKioskApp:
         self.card_entry.after(50, self.focus_scan_entry)
         self.root.after(20, self.render_report_banner)
 
-        self.primary_button(left, "확인", self.check_user, width=240, height=60, font_size=20).pack(pady=(0, 28))
+        self.primary_button(left, "확인", self.check_user, width=240, height=56, font_size=20).pack(pady=(0, 8))
 
         divider = ctk.CTkFrame(card, fg_color=COLOR_BORDER, height=1)
-        divider.pack(fill="x", pady=(4, 24))
+        divider.pack(fill="x", pady=(0, 10))
 
-        self.body_label(card, "바코드 리더기로 학생증을 찍거나 학생증 코드를 직접 입력하세요.", size=16, muted=True).pack(pady=(0, 6))
-        self.body_label(card, "한글 입력 상태여도 학생증 코드는 자동으로 영어 코드로 보정됩니다.", size=14, muted=True).pack()
+        # 위에 USB 안내가 들어가 자리가 줄었으므로 두 줄을 한 줄로 합친다
+        # (고장 신고 안내가 첫 화면 아래쪽에 크게 뜰 때 가려지지 않게)
+        self.body_label(
+            card,
+            "바코드 리더기로 학생증을 찍거나 코드를 직접 입력하세요. (한글 입력 상태여도 자동으로 보정됩니다)",
+            size=15, muted=True
+        ).pack()
         self.body_label(
             card,
             "암호가 걸린 한글(HWP) 파일은 출력할 수 없습니다. 암호를 없애거나 PDF로 저장해 오세요.",
@@ -5964,6 +6197,14 @@ class PrinterKioskApp:
 
         process = None
 
+        # 띄우기 전에 이미 떠 있던 브라우저 창을 기억해 둔다.
+        # (크롬 업데이트 직후처럼 실행한 프로세스가 새 프로세스에 창을 넘기고 바로
+        #  끝나 버리는 경우가 있어, 그때는 '새로 생긴 브라우저 창' 으로 찾아야 한다)
+        self._external_hwnd = None
+        self._external_hwnd_pid = None
+        self._external_started = time.time()
+        self._external_known_hwnds = set(self._list_browser_windows())
+
         # 전용 프로필을 써야 항상 독립 프로세스로 뜬다.
         # (이미 크롬이 켜져 있으면 새 프로세스가 창만 넘기고 바로 종료된다)
         profile_dir = os.path.join(tempfile.gettempdir(), "school_printer_browser")
@@ -5975,16 +6216,20 @@ class PrinterKioskApp:
 
         for path in chrome_paths + edge_paths:
             if os.path.exists(path):
+                args = [
+                    path,
+                    "--kiosk",
+                    url,
+                    f"--user-data-dir={profile_dir}",
+                    "--no-first-run",
+                    "--no-default-browser-check",
+                    "--disable-features=TranslateUI",
+                ]
+                # 엣지는 키오스크 종류를 정해 줘야 전체화면 키오스크로 뜬다
+                if path in edge_paths:
+                    args.append("--edge-kiosk-type=fullscreen")
                 try:
-                    process = subprocess.Popen([
-                        path,
-                        "--kiosk",
-                        url,
-                        f"--user-data-dir={profile_dir}",
-                        "--no-first-run",
-                        "--no-default-browser-check",
-                        "--disable-features=TranslateUI",
-                    ])
+                    process = subprocess.Popen(args)
                     break
                 except Exception:
                     continue
@@ -6052,8 +6297,8 @@ class PrinterKioskApp:
 
                 return True
 
-            # 최대 8초 동안 창을 찾는다
-            for _ in range(40):
+            # 최대 10초 동안 창을 찾는다
+            for _ in range(50):
                 time.sleep(0.2)
                 found.clear()
 
@@ -6062,8 +6307,22 @@ class PrinterKioskApp:
                 except Exception:
                     return
 
+                # 실행한 프로세스가 창을 다른 프로세스에 넘기고 끝난 경우:
+                # 띄우기 전에는 없던 브라우저 창을 대신 찾는다
+                if not found:
+                    known = getattr(self, "_external_known_hwnds", set())
+                    fresh = [h for h in self._list_browser_windows() if h not in known]
+                    if fresh:
+                        found.append(fresh[0])
+
                 if found:
                     hwnd = found[0]
+
+                    # 이 창이 살아 있는 동안은 닫기 버튼을 유지한다
+                    self._external_hwnd = hwnd
+                    owner_pid = wintypes.DWORD()
+                    user32.GetWindowThreadProcessId(hwnd, ctypes.byref(owner_pid))
+                    self._external_hwnd_pid = owner_pid.value or None
                     try:
                         HWND_TOPMOST = -1
                         SWP_NOMOVE = 0x0002
@@ -6131,24 +6390,124 @@ class PrinterKioskApp:
         # 브라우저가 살아 있는지 주기적으로 확인
         self._watch_external_process()
 
+    # 키오스크로 띄우는 브라우저 실행 파일 이름
+    BROWSER_EXE_NAMES = ("chrome.exe", "msedge.exe")
+
+    def _list_browser_windows(self):
+        """지금 화면에 보이는 크롬 · 엣지 창(HWND) 목록. Windows 가 아니면 빈 목록."""
+        try:
+            import ctypes
+            import ctypes.wintypes as wintypes
+        except ImportError:
+            return []
+
+        try:
+            user32 = ctypes.windll.user32
+            kernel32 = ctypes.windll.kernel32
+        except Exception:
+            return []
+
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        names = {}
+        result = []
+
+        def exe_name(pid):
+            if pid in names:
+                return names[pid]
+            name = ""
+            handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+            if handle:
+                try:
+                    buf = ctypes.create_unicode_buffer(1024)
+                    size = wintypes.DWORD(1024)
+                    if kernel32.QueryFullProcessImageNameW(handle, 0, buf, ctypes.byref(size)):
+                        name = os.path.basename(buf.value).lower()
+                finally:
+                    kernel32.CloseHandle(handle)
+            names[pid] = name
+            return name
+
+        EnumWindowsProc = ctypes.WINFUNCTYPE(ctypes.c_bool, wintypes.HWND, wintypes.LPARAM)
+
+        def callback(hwnd, lparam):
+            try:
+                if not user32.IsWindowVisible(hwnd) or user32.GetWindowTextLengthW(hwnd) <= 0:
+                    return True
+                pid = wintypes.DWORD()
+                user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+                if exe_name(pid.value) in self.BROWSER_EXE_NAMES:
+                    result.append(hwnd)
+            except Exception:
+                pass
+            return True
+
+        try:
+            user32.EnumWindows(EnumWindowsProc(callback), 0)
+        except Exception:
+            return []
+
+        return result
+
+    def _external_window_alive(self):
+        """키오스크 브라우저 창이 아직 떠 있는지."""
+        hwnd = getattr(self, "_external_hwnd", None)
+        if not hwnd:
+            return False
+        try:
+            import ctypes
+            user32 = ctypes.windll.user32
+            return bool(user32.IsWindow(hwnd)) and bool(user32.IsWindowVisible(hwnd))
+        except Exception:
+            return False
+
+    def _raise_overlay(self, overlay):
+        """
+        닫기 버튼 창을 Windows API 로 직접 최상위 맨 앞에 올린다.
+
+        브라우저도 최상위(TOPMOST)로 올려 두기 때문에 Tk 의 lift() 만으로는
+        브라우저 뒤로 숨는 경우가 있다. 포커스는 빼앗지 않는다(NOACTIVATE).
+        """
+        try:
+            overlay.attributes("-topmost", True)
+            overlay.lift()
+        except Exception:
+            pass
+
+        try:
+            import ctypes
+            hwnd = self._window_handle(overlay)
+            if hwnd:
+                HWND_TOPMOST = -1
+                SWP_NOSIZE, SWP_NOMOVE = 0x0001, 0x0002
+                SWP_NOACTIVATE, SWP_SHOWWINDOW = 0x0010, 0x0040
+                ctypes.windll.user32.SetWindowPos(
+                    hwnd, HWND_TOPMOST, 0, 0, 0, 0,
+                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW
+                )
+        except Exception:
+            pass
+
     def _watch_external_process(self):
         """브라우저가 종료되면 닫기 버튼도 없애고 원래 화면으로 돌아온다."""
         process = getattr(self, "_external_process", None)
 
-        if process is None or process.poll() is not None:
+        process_alive = process is not None and process.poll() is None
+        window_alive = self._external_window_alive()
+
+        # 실행한 프로세스가 창을 넘기고 바로 끝나는 경우가 있어서
+        # 프로세스와 창 둘 다 없어졌을 때만 닫는다.
+        # 띄운 직후(창이 아직 안 잡힌 10초 동안)는 기다려 준다.
+        just_started = time.time() - getattr(self, "_external_started", 0) < 10
+        waiting_for_window = just_started and not getattr(self, "_external_hwnd", None)
+
+        if not process_alive and not window_alive and not waiting_for_window:
             self.close_external_site()
             return
 
         # 다른 창이 닫기 버튼을 가리지 않도록 계속 위로 올린다.
-        # 브라우저를 최상위(TOPMOST)로 만들었기 때문에 이 버튼도
-        # 계속 최상위로 다시 올려주지 않으면 브라우저 뒤로 숨는다.
         overlay = getattr(self, "_close_overlay", None)
         if overlay is not None:
-            try:
-                overlay.attributes("-topmost", True)
-                overlay.lift()
-            except Exception:
-                pass
+            self._raise_overlay(overlay)
 
         self._overlay_job = self.root.after(400, self._watch_external_process)
 
@@ -6156,17 +6515,34 @@ class PrinterKioskApp:
         """브라우저를 종료하고 제어 프로그램 화면으로 돌아온다."""
         process = getattr(self, "_external_process", None)
 
+        # 실행한 프로세스와, 실제 창을 가진 프로세스(다를 수 있음)를 모두 닫는다.
+        # 하위 프로세스까지 함께 끝내야(/T) 전용 프로필이 잠긴 채 남지 않고,
+        # 다음에 열 때도 닫기 버튼이 정상으로 붙는다.
+        pids = set()
+        if process is not None and process.poll() is None:
+            pids.add(process.pid)
+        if getattr(self, "_external_hwnd_pid", None) and self._external_window_alive():
+            pids.add(self._external_hwnd_pid)
+
+        for pid in pids:
+            try:
+                subprocess.run(
+                    ["taskkill", "/PID", str(pid), "/T", "/F"],
+                    capture_output=True, timeout=5,
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)
+                )
+            except Exception:
+                pass
+
         if process is not None and process.poll() is None:
             try:
-                process.terminate()
-                process.wait(timeout=3)
+                process.kill()
             except Exception:
-                try:
-                    process.kill()
-                except Exception:
-                    pass
+                pass
 
         self._external_process = None
+        self._external_hwnd = None
+        self._external_hwnd_pid = None
         self.close_external_overlay()
         self.close_auto_delete_overlay()
         self.restore_kiosk_focus()
