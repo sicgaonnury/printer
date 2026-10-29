@@ -99,7 +99,7 @@ DB_NAME = "school_printer.db"
 # 프로그램이 스스로 업데이트를 확인하는 일은 없다.
 # 관리자가 버튼을 눌렀을 때만 확인한다.
 # -----------------------------
-APP_VERSION = "1.6.10"
+APP_VERSION = "1.6.11"
 GITHUB_REPO = "sicgaonnury/printer"
 DEFAULT_ADMIN_PASSWORD = "1234"
 
@@ -773,6 +773,8 @@ SETTING_LABELS = {
     "admin_mode": "관리자 방식",
     "idle_minutes": "자리 비움 복귀(분)",
     "student_number_format": "학번 형식",
+    "shared_usb_minutes": "공용 USB 자동 삭제(분)",
+    "shared_usb_delete_after_print": "공용 USB 출력 후 삭제",
 }
 
 SECRET_SETTINGS = {"admin_password", "admin_barcode"}
@@ -782,6 +784,7 @@ _SETTING_VALUE_NAMES = {
     "delete_mode": {"time": "지우지 않음", "print": "바로 지움", "print_delay": "유예 후 지움"},
     "admin_mode": {"single": "단일 비밀번호", "individual": "관리자별 비밀번호"},
     "student_number_format": {"plain": "10101 그대로", "dashed": "1-1-1 → 10101"},
+    "shared_usb_delete_after_print": {"0": "끔", "1": "켬"},
     "fullscreen": {"0": "끔", "1": "켬"},
     "block_system_keys": {"0": "끔", "1": "켬"},
 }
@@ -1521,6 +1524,262 @@ def scan_download_folder():
             else:
                 del _download_watch[path]
                 _delete_after_print.pop(os.path.abspath(path), None)
+
+
+# -----------------------------
+# 공용 USB
+#
+# 프린터 옆에 끈으로 묶어 둔 학교 USB. 학생이 자기 기기에서 파일을 옮겨 와 출력한다.
+# 앞 사람 파일이 남지 않도록 (1) 정해 둔 시간이 지나면, (2) 출력이 끝나면 바로 지운다.
+#
+# 학생 개인 USB 를 지우면 절대 안 되므로, 관리자가 '공용 USB 로 지정' 할 때
+# USB 맨 위에 표시 파일(SHARED_USB_MARKER)을 만들어 두고, 이 파일이 있는 USB 만 다룬다.
+# -----------------------------
+SHARED_USB_MARKER = ".school_printer_shared_usb"
+DEFAULT_SHARED_USB_MINUTES = 15
+
+# 지우지 않는 것: 표시 파일과 Windows 가 USB 에 만드는 시스템 폴더
+_SHARED_USB_SKIP = {SHARED_USB_MARKER.lower(), "system volume information", "$recycle.bin"}
+
+# 공용 USB 의 파일을 처음 본 시각. {(USB 일련번호, 상대경로, 크기): 시각}
+_shared_usb_seen = {}
+_shared_usb_lock = threading.Lock()
+
+
+def get_shared_usb_minutes():
+    """공용 USB 에 들어온 파일을 몇 분 뒤에 지울지. 0 이면 시간으로는 지우지 않는다."""
+    try:
+        return max(0, int(get_setting("shared_usb_minutes", str(DEFAULT_SHARED_USB_MINUTES))))
+    except (TypeError, ValueError):
+        return DEFAULT_SHARED_USB_MINUTES
+
+
+def get_shared_usb_delete_after_print():
+    """출력이 끝나면 공용 USB 의 그 파일을 바로 지울지."""
+    return get_setting("shared_usb_delete_after_print", "1") == "1"
+
+
+def _drive_roots():
+    """
+    이 컴퓨터의 이동식 · 고정 드라이브 뿌리 경로들. (네트워크 · CD 드라이브는 빼서 멈추지 않게)
+    Windows 가 아니면 빈 목록.
+    """
+    if os.name != "nt":
+        return []
+
+    try:
+        import ctypes
+        kernel32 = ctypes.windll.kernel32
+        mask = kernel32.GetLogicalDrives()
+    except Exception:
+        return []
+
+    DRIVE_REMOVABLE, DRIVE_FIXED = 2, 3
+    system_drive = (os.environ.get("SystemDrive") or "C:").upper().rstrip("\\") + "\\"
+    roots = []
+
+    for i in range(26):
+        if not mask & (1 << i):
+            continue
+        root = f"{chr(65 + i)}:\\"
+        if root.upper() == system_drive:
+            continue
+        try:
+            kind = kernel32.GetDriveTypeW(root)
+        except Exception:
+            continue
+        # USB 메모리는 대부분 '이동식', 일부 USB 외장 SSD 는 '고정' 으로 잡힌다
+        if kind in (DRIVE_REMOVABLE, DRIVE_FIXED):
+            roots.append(root)
+
+    return roots
+
+
+def _volume_serial(root):
+    """USB 를 구분하는 일련번호. 못 읽으면 경로를 대신 쓴다."""
+    try:
+        import ctypes
+        serial = ctypes.c_ulong(0)
+        ok = ctypes.windll.kernel32.GetVolumeInformationW(
+            ctypes.c_wchar_p(root), None, 0, ctypes.byref(serial), None, None, None, 0
+        )
+        if ok:
+            return f"{serial.value:08X}"
+    except Exception:
+        pass
+    return root
+
+
+def find_shared_usb():
+    """지금 꽂혀 있는 공용 USB 의 뿌리 경로(예: 'E:\\'). 없으면 None."""
+    for root in _drive_roots():
+        try:
+            if os.path.isfile(os.path.join(root, SHARED_USB_MARKER)):
+                return root
+        except OSError:
+            continue
+    return None
+
+
+def list_usb_candidates():
+    """관리자 화면에서 공용 USB 로 지정할 수 있는 드라이브들. [(뿌리, 이름, 이미 지정됨)]"""
+    result = []
+    for root in _drive_roots():
+        label = ""
+        try:
+            import ctypes
+            buf = ctypes.create_unicode_buffer(261)
+            if ctypes.windll.kernel32.GetVolumeInformationW(
+                ctypes.c_wchar_p(root), buf, 261, None, None, None, None, 0
+            ):
+                label = buf.value
+        except Exception:
+            pass
+        marked = os.path.isfile(os.path.join(root, SHARED_USB_MARKER))
+        result.append((root, label, marked))
+    return result
+
+
+def mark_shared_usb(root):
+    """이 USB 를 공용 USB 로 지정한다. (숨김 표시 파일을 만든다)"""
+    path = os.path.join(root, SHARED_USB_MARKER)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(
+            "서인천고등학교 공용 프린터 - 공용 USB 표시 파일\n"
+            "이 파일이 있는 USB 의 파일은 정해 둔 시간이 지나거나 출력이 끝나면 자동으로 지워집니다.\n"
+            "이 파일을 지우면 공용 USB 지정이 풀립니다.\n"
+            f"지정한 날: {date.today()}\n"
+        )
+    try:
+        import ctypes
+        FILE_ATTRIBUTE_HIDDEN = 0x2
+        ctypes.windll.kernel32.SetFileAttributesW(path, FILE_ATTRIBUTE_HIDDEN)
+    except Exception:
+        pass
+
+
+def unmark_shared_usb(root):
+    """공용 USB 지정을 푼다. (표시 파일만 지우고 다른 파일은 건드리지 않는다)"""
+    path = os.path.join(root, SHARED_USB_MARKER)
+    try:
+        import ctypes
+        ctypes.windll.kernel32.SetFileAttributesW(path, 0x80)   # 숨김 해제 후 삭제
+    except Exception:
+        pass
+    os.remove(path)
+
+
+def is_on_shared_usb(path):
+    """이 파일이 공용 USB 안에 있는지."""
+    root = find_shared_usb()
+    if not root or not path:
+        return False
+    try:
+        return os.path.abspath(path).upper().startswith(os.path.abspath(root).upper())
+    except Exception:
+        return False
+
+
+def _iter_shared_usb_files(root):
+    """공용 USB 안의 지울 수 있는 파일들. (표시 파일 · 시스템 폴더는 뺀다)"""
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d.lower() not in _SHARED_USB_SKIP]
+        for name in filenames:
+            if name.lower() in _SHARED_USB_SKIP:
+                continue
+            path = os.path.join(dirpath, name)
+            if os.path.islink(path):
+                continue
+            yield path
+
+
+def _remove_empty_dirs(root):
+    """파일을 지우고 비어 버린 폴더를 정리한다. (뿌리와 시스템 폴더는 남긴다)"""
+    for dirpath, dirnames, filenames in os.walk(root, topdown=False):
+        if os.path.abspath(dirpath) == os.path.abspath(root):
+            continue
+        if os.path.basename(dirpath).lower() in _SHARED_USB_SKIP:
+            continue
+        try:
+            if not os.listdir(dirpath):
+                os.rmdir(dirpath)
+        except OSError:
+            pass
+
+
+def scan_shared_usb():
+    """
+    공용 USB 에서 들어온 지 정해 둔 시간이 지난 파일을 지운다. (1분마다 불린다)
+    돌려주는 값: 지운 파일 수
+
+    '들어온 시각' 은 아래 두 값 중 늦은 쪽으로 본다.
+      · 파일의 만든 날짜 — USB 로 복사하는 순간의 시각이 찍힌다
+      · 이 프로그램이 그 파일을 처음 본 시각 — 다른 컴퓨터에서 넣고 다시 꽂은 경우 대비
+    파일의 '수정한 날짜' 는 복사해도 원래 날짜가 남으므로 쓰지 않는다.
+    (그걸 기준으로 하면 어제 만든 파일을 방금 넣었는데 바로 지워진다)
+    """
+    minutes = get_shared_usb_minutes()
+    root = find_shared_usb()
+
+    if not root or minutes <= 0:
+        return 0
+
+    serial = _volume_serial(root)
+    now = time.time()
+    limit = minutes * 60
+    removed = 0
+
+    with _shared_usb_lock:
+        alive = set()
+
+        for path in _iter_shared_usb_files(root):
+            try:
+                st = os.stat(path)
+            except OSError:
+                continue
+
+            key = (serial, os.path.relpath(path, root).lower(), st.st_size)
+            alive.add(key)
+            first_seen = _shared_usb_seen.setdefault(key, now)
+
+            # Windows 에서 '만든 날짜' (파이썬 3.12 부터는 st_birthtime)
+            created = getattr(st, "st_birthtime", None) or getattr(st, "st_ctime", 0) or 0
+            arrived = max(first_seen, created)
+            if now - arrived < limit:
+                continue
+
+            try:
+                os.remove(path)
+                removed += 1
+            except OSError:
+                continue
+            _shared_usb_seen.pop(key, None)
+
+        # 이 USB 에서 사라진 파일은 기록에서 뺀다 (다른 USB 의 기록은 그대로 둔다)
+        for key in list(_shared_usb_seen):
+            if key[0] == serial and key not in alive:
+                _shared_usb_seen.pop(key, None)
+
+    if removed:
+        _remove_empty_dirs(root)
+
+    return removed
+
+
+def delete_shared_usb_file_after_print(path):
+    """출력이 끝난 공용 USB 파일을 바로 지운다. 지웠으면 True."""
+    if not get_shared_usb_delete_after_print() or not is_on_shared_usb(path):
+        return False
+    if os.path.basename(path).lower() == SHARED_USB_MARKER.lower():
+        return False
+    try:
+        os.remove(path)
+    except OSError:
+        return False
+    root = find_shared_usb()
+    if root:
+        _remove_empty_dirs(root)
+    return True
 
 
 def get_student(card_code):
@@ -2380,6 +2639,10 @@ def cleanup_after_print(file_path, printed_pdf_path):
         except OSError:
             pass
         return "deleted", 0
+
+    # 공용 USB 에서 고른 파일은 설정에 따라 출력이 끝나면 바로 지운다
+    if delete_shared_usb_file_after_print(file_path):
+        return "usb_deleted", 0
 
     if not is_in_download_dir(file_path):
         return None, 0
@@ -3961,6 +4224,191 @@ def make_qr_image(text, size=200):
         return img
     except Exception:
         return None
+
+
+# -----------------------------
+# 파일 보내기 화면에 띄우는 와이파이 정보
+#
+# 이 컴퓨터가 지금 연결된 와이파이를 직접 읽어서 보여 준다.
+#   · 이름   : netsh wlan show interfaces 의 SSID
+#   · 비밀번호: netsh wlan show profile name=... key=clear 의 '키 콘텐츠'
+# 학생 기기가 이 컴퓨터와 같은 와이파이에 붙어야 파일이 오므로,
+# 컴퓨터가 붙어 있는 와이파이를 그대로 안내하는 것이 가장 정확하다.
+#
+# 아래 두 값은 읽지 못했을 때(유선 연결, 권한 부족 등)만 쓰는 예비값이다.
+# DB 설정 share_wifi_ssid / share_wifi_password 가 있으면 예비값보다 우선한다.
+# -----------------------------
+SHARE_WIFI_SSID = "Sc_ice_ap50"
+SHARE_WIFI_PASSWORD = "westhi_school_23"
+
+# netsh 를 화면을 열 때마다 부르면 잠깐씩 멈추므로 잠시 기억해 둔다
+_WIFI_CACHE = {"at": 0.0, "value": None}
+_WIFI_CACHE_SECONDS = 60
+
+
+def _decode_console(raw):
+    """netsh 출력은 PC 언어 설정에 따라 인코딩이 달라서 차례로 시도한다."""
+    for enc in ("utf-8", "cp949", "mbcs"):
+        try:
+            return raw.decode(enc)
+        except Exception:
+            continue
+    return raw.decode("utf-8", errors="replace")
+
+
+def _run_netsh(args, timeout=4):
+    try:
+        result = subprocess.run(
+            ["netsh"] + list(args),
+            capture_output=True, timeout=timeout,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        )
+    except Exception:
+        return ""
+    return _decode_console(result.stdout or b"")
+
+
+def _netsh_fields(text):
+    """'    이름   : 값' 형태의 줄들을 [(이름, 값), ...] 으로 나눈다. (BSSID 의 ':' 는 값 쪽에 남는다)"""
+    fields = []
+    for line in text.splitlines():
+        if ":" not in line:
+            continue
+        key, _, value = line.partition(":")
+        key, value = key.strip(), value.strip()
+        if key:
+            fields.append((key, value))
+    return fields
+
+
+def parse_wlan_interfaces(text):
+    """
+    netsh wlan show interfaces 출력에서 연결된 와이파이를 찾는다.
+    돌려주는 값: {"ssid": 이름, "auth": 인증 방식} 또는 None
+    한국어 · 영어 Windows 모두 읽는다.
+    """
+    current = {}
+    found = []
+
+    def flush():
+        if current.get("ssid") and current.get("connected", True):
+            found.append(dict(current))
+
+    for key, value in _netsh_fields(text):
+        low = key.lower()
+
+        # 인터페이스가 바뀌는 지점 ('이름' / 'Name')
+        if low in ("이름", "name"):
+            flush()
+            current = {}
+            continue
+
+        if low == "ssid":
+            current["ssid"] = value
+        elif low in ("상태", "state"):
+            current["connected"] = value.lower() in ("연결됨", "connected")
+        elif low in ("인증", "authentication"):
+            current["auth"] = value
+
+    flush()
+
+    if not found:
+        return None
+
+    info = found[0]
+    return {"ssid": info["ssid"], "auth": info.get("auth", "")}
+
+
+def parse_wlan_profile_key(text):
+    """
+    netsh wlan show profile name=... key=clear 출력에서 비밀번호를 찾는다.
+    돌려주는 값: (비밀번호 또는 None, 엔터프라이즈 여부)
+    """
+    password = None
+    enterprise = False
+
+    for key, value in _netsh_fields(text):
+        low = key.lower()
+        if low in ("키 콘텐츠", "key content"):
+            password = value or None
+        elif low in ("인증", "authentication"):
+            v = value.lower()
+            if "엔터프라이즈" in v or "enterprise" in v or "802.1x" in v:
+                enterprise = True
+
+    return password, enterprise
+
+
+def detect_connected_wifi():
+    """
+    이 컴퓨터가 지금 연결된 와이파이를 읽는다. Windows 가 아니거나 유선이면 None.
+    돌려주는 값: {"ssid", "password"(없으면 None), "enterprise"}
+    """
+    if os.name != "nt":
+        return None
+
+    info = parse_wlan_interfaces(_run_netsh(["wlan", "show", "interfaces"]))
+    if not info:
+        return None
+
+    ssid = info["ssid"]
+    password, enterprise = parse_wlan_profile_key(
+        _run_netsh(["wlan", "show", "profile", f"name={ssid}", "key=clear"])
+    )
+
+    auth = (info.get("auth") or "").lower()
+    if "엔터프라이즈" in auth or "enterprise" in auth:
+        enterprise = True
+
+    return {"ssid": ssid, "password": password, "enterprise": enterprise}
+
+
+def get_share_wifi(force=False):
+    """
+    파일 보내기 화면에 안내할 와이파이.
+    돌려주는 값: (이름, 비밀번호 또는 None, 출처)
+      출처 'auto'  : 이 컴퓨터가 연결된 와이파이를 읽어 온 값
+      출처 'saved' : 읽지 못해 예비값(설정 · 프로그램 위쪽 상수)을 쓴 값
+    """
+    try:
+        fallback_ssid = get_setting("share_wifi_ssid", "") or SHARE_WIFI_SSID
+        fallback_pw = get_setting("share_wifi_password", "") or SHARE_WIFI_PASSWORD
+    except Exception:
+        fallback_ssid, fallback_pw = SHARE_WIFI_SSID, SHARE_WIFI_PASSWORD
+
+    now = time.time()
+    if force or _WIFI_CACHE["value"] is None or now - _WIFI_CACHE["at"] > _WIFI_CACHE_SECONDS:
+        try:
+            _WIFI_CACHE["value"] = detect_connected_wifi() or {}
+        except Exception:
+            _WIFI_CACHE["value"] = {}
+        _WIFI_CACHE["at"] = now
+
+    found = _WIFI_CACHE["value"] or {}
+
+    if found.get("ssid"):
+        password = found.get("password")
+
+        # 비밀번호를 못 읽었는데 예비값과 같은 와이파이라면 예비 비밀번호를 쓴다
+        if not password and not found.get("enterprise") and found["ssid"] == fallback_ssid:
+            password = fallback_pw
+
+        return found["ssid"], password, "auto"
+
+    return fallback_ssid, fallback_pw, "saved"
+
+
+def wifi_qr_payload(ssid, password):
+    """휴대폰 카메라로 찍으면 바로 연결되는 와이파이 QR 내용."""
+    def esc(text):
+        for ch in ("\\", ";", ",", ":", '"'):
+            text = text.replace(ch, "\\" + ch)
+        return text
+
+    if not password:
+        return f"WIFI:T:nopass;S:{esc(ssid)};;"
+
+    return f"WIFI:T:WPA;S:{esc(ssid)};P:{esc(password)};H:;;"
 
 
 FIREWALL_RULE_NAME = "School Printer Upload"
@@ -6001,7 +6449,7 @@ class PrinterKioskApp:
 
         ctk.CTkLabel(
             usb_inner,
-            text="출력할 파일을 USB에 담아 와서 컴퓨터에 꽂은 뒤, 학생증을 찍으세요.",
+            text="USB를 꽂은 뒤 학생증을 찍으세요.  USB가 없으면 모니터 옆 공용 USB를 쓰세요.",
             font=(self.font_family, 18),
             text_color=COLOR_USB_NOTICE_SUB
         ).pack(pady=(6, 0))
@@ -6080,20 +6528,61 @@ class PrinterKioskApp:
             fg_color=COLOR_BG, hover_color=COLOR_SECONDARY_BG
         ).place(relx=1.0, rely=1.0, anchor="se", x=-28, y=-24)
 
-        self.secondary_button(
-            self.outer, "파일 공유",
-            self.file_share_screen,
-            width=150, height=44, font_size=14,
-            fg_color=COLOR_BG, hover_color=COLOR_SECONDARY_BG
-        ).place(relx=1.0, rely=1.0, anchor="se", x=-188, y=-24)
+        # 학생증을 찍은 뒤의 파일 선택 화면에서는 '파일 공유' 를 크게 강조한다
+        highlight = getattr(self, "_highlight_share_button", False)
+        self._highlight_share_button = False
+
+        if not highlight:
+            self.secondary_button(
+                self.outer, "파일 공유",
+                self.file_share_screen,
+                width=150, height=44, font_size=14,
+                fg_color=COLOR_BG, hover_color=COLOR_SECONDARY_BG
+            ).place(relx=1.0, rely=1.0, anchor="se", x=-188, y=-24)
+            return
+
+        share_btn = ctk.CTkButton(
+            self.outer, text="파일 공유  ▶", command=self.file_share_screen,
+            width=200, height=58, corner_radius=14,
+            font=(self.font_family, 19, "bold"),
+            fg_color=COLOR_PRIMARY, hover_color=COLOR_PRIMARY_HOVER,
+            text_color="#FFFFFF", border_width=3, border_color=COLOR_PRIMARY_SOFT
+        )
+        share_btn.place(relx=1.0, rely=1.0, anchor="se", x=-188, y=-18)
+
+        ctk.CTkLabel(
+            self.outer, text="와이파이로 파일 보내기  ▼",
+            font=(self.font_family, 15, "bold"), text_color=COLOR_PRIMARY,
+            fg_color=COLOR_BG
+        ).place(relx=1.0, rely=1.0, anchor="se", x=-196, y=-84)
+
+        # 눈에 띄도록 테두리를 천천히 깜빡인다 (버튼이 사라지면 스스로 멈춘다)
+        def pulse(on=True):
+            try:
+                if not share_btn.winfo_exists():
+                    return
+                share_btn.configure(border_color="#9DB8FF" if on else COLOR_PRIMARY_SOFT)
+                share_btn.after(650, lambda: pulse(not on))
+            except Exception:
+                pass
+
+        pulse()
 
     def start_download_cleanup(self):
         """
         받은 파일 폴더를 주기적으로 확인해서 보관 시간이 지난 파일을 지운다.
         30초마다 한 번씩 돌며, 화면 동작을 막지 않도록 별도 스레드에서 처리한다.
         """
+        def scan_all():
+            scan_download_folder()
+            # 공용 USB 도 같은 주기로 확인한다 (지정된 USB 가 꽂혀 있을 때만 동작)
+            try:
+                scan_shared_usb()
+            except Exception:
+                pass
+
         def tick():
-            threading.Thread(target=scan_download_folder, daemon=True).start()
+            threading.Thread(target=scan_all, daemon=True).start()
             self.root.after(30_000, tick)
 
         self.root.after(5_000, tick)
@@ -6645,8 +7134,14 @@ class PrinterKioskApp:
 
     def file_share_qr_screen(self, token, number, name):
         """
-        파일 공유 2단계 — 접속 주소와 QR 코드 안내.
-        이 주소는 학생증을 스캔한 사람에게만 발급되는 전용 주소다.
+        파일 공유 2단계 — 단계별 안내.
+
+          ① 와이파이 연결   (이름 · 비밀번호 · 연결 QR)
+          ② 파일 전송       (학생 전용 주소 QR · 노트북용 주소)
+          ③ 예, 출력합니다  (파일이 도착하면 이 칸에 버튼이 뜬다)
+          ④ 출력            (출력 정보 확인 화면에서 출력 시작)
+
+        전송 주소는 학생증을 스캔한 사람에게만 발급되는 전용 주소다.
         """
         card = self.build_card()
         self.make_title(card, "파일 보내기")
@@ -6654,67 +7149,142 @@ class PrinterKioskApp:
         url = get_file_share_url(token)
         label = f"{number} {name}".strip() if number else name
 
-        self.body_label(card, f"{label} 님", size=19, bold=True).pack(pady=(0, 6))
-
         self.body_label(
-            card,
-            "휴대폰 또는 태블릿PC에서는 QR코드를 스캔하시고,\n노트북은 아래 주소를 입력하세요.",
-            size=16
-        ).pack(pady=(0, 16))
+            card, f"{label} 님 · 아래 순서대로 진행하세요",
+            size=17, bold=True
+        ).pack(pady=(0, 14))
 
-        # ── QR 코드와 주소를 나란히 ──
-        # 휴대폰은 QR, 노트북은 주소 입력이라 둘 다 보여야 한다.
-        share_row = ctk.CTkFrame(card, fg_color="transparent")
-        share_row.pack(pady=(0, 16))
+        steps_row = ctk.CTkFrame(card, fg_color="transparent")
+        steps_row.pack(pady=(0, 14))
 
-        qr_image = make_qr_image(url, size=210)
+        STEP_W = 272          # 단계 칸 너비
+        QR_SIZE = 168         # 두 QR 크기를 같게 맞춘다
 
-        if qr_image is not None and ImageTk is not None:
-            qr_frame = ctk.CTkFrame(
-                share_row, fg_color="#FFFFFF", corner_radius=14,
-                border_width=1, border_color=COLOR_BORDER
+        # 네 칸의 너비를 똑같이 맞춘다 (내용 길이에 따라 들쭉날쭉하지 않게)
+        for col in range(4):
+            steps_row.grid_columnconfigure(col, uniform="share_step", minsize=STEP_W + 14)
+
+        def step_box(col, num, title):
+            """번호 · 제목이 붙은 단계 칸을 만들고 (칸, 내용 틀) 을 돌려준다."""
+            box = ctk.CTkFrame(
+                steps_row, fg_color=COLOR_CARD, corner_radius=16,
+                border_width=2, border_color=COLOR_BORDER, width=STEP_W
             )
-            qr_frame.grid(row=0, column=0, padx=(0, 22))
+            box.grid(row=0, column=col, padx=7, sticky="nsew")
 
-            photo = ImageTk.PhotoImage(qr_image)
-            qr_label = tk.Label(qr_frame, image=photo, bg="#FFFFFF", borderwidth=0)
-            qr_label.image = photo      # 참조를 유지해야 이미지가 사라지지 않는다
-            qr_label.pack(padx=12, pady=12)
+            head = ctk.CTkFrame(box, fg_color="transparent")
+            head.pack(fill="x", padx=16, pady=(14, 8))
 
-        addr_frame = ctk.CTkFrame(share_row, fg_color=COLOR_ENTRY_BG, corner_radius=16)
-        addr_frame.grid(row=0, column=1)
+            ctk.CTkLabel(
+                head, text=str(num), width=30, height=30, corner_radius=9,
+                fg_color=COLOR_PRIMARY, text_color="#FFFFFF",
+                font=(self.font_family, 15, "bold")
+            ).pack(side="left")
 
+            ctk.CTkLabel(
+                head, text=title, font=(self.font_family, 18, "bold"),
+                text_color=COLOR_TEXT
+            ).pack(side="left", padx=(10, 0))
+
+            body = ctk.CTkFrame(box, fg_color="transparent", width=STEP_W - 32)
+            body.pack(fill="both", expand=True, padx=16, pady=(0, 14))
+            return box, body
+
+        def qr_widget(parent, text):
+            image = make_qr_image(text, size=QR_SIZE)
+            if image is None or ImageTk is None:
+                return None
+            photo = ImageTk.PhotoImage(image)
+            widget = tk.Label(parent, image=photo, bg=COLOR_CARD, borderwidth=0)
+            widget.image = photo      # 참조를 유지해야 이미지가 사라지지 않는다
+            widget.pack(pady=(2, 6))
+            return widget
+
+        def small(parent, text, bold=False, color=None, size=13, pady=(0, 0)):
+            ctk.CTkLabel(
+                parent, text=text, justify="center", wraplength=STEP_W - 36,
+                font=(self.font_family, size, "bold" if bold else "normal"),
+                text_color=color or COLOR_TEXT_MUTED
+            ).pack(pady=pady)
+
+        # ── ① 와이파이 연결 ──
+        # 이 컴퓨터가 지금 연결된 와이파이를 읽어 온다 (못 읽으면 예비값)
+        ssid, password, wifi_source = get_share_wifi()
+        _, body1 = step_box(0, 1, "와이파이 연결")
+
+        if password:
+            qr_widget(body1, wifi_qr_payload(ssid, password))
+            small(body1, "카메라로 찍으면 바로 연결", size=12)
+        else:
+            # 비밀번호를 알 수 없는 와이파이(학교 계정 로그인 방식 등)는
+            # 잘못된 QR 을 띄우지 않고 이름만 크게 안내한다
+            small(
+                body1,
+                "휴대폰 설정 → Wi-Fi 에서\n아래 와이파이에 연결하세요.",
+                size=14, color=COLOR_TEXT, pady=(34, 18)
+            )
+
+        cred = ctk.CTkFrame(body1, fg_color=COLOR_PRIMARY_SOFT, corner_radius=10)
+        cred.pack(fill="x", pady=(8, 0))
+
+        rows = [("이름", ssid)]
+        if password:
+            rows.append(("비번", password))
+
+        for i, (key, value) in enumerate(rows):
+            last = i == len(rows) - 1
+            line = ctk.CTkFrame(cred, fg_color="transparent")
+            line.pack(fill="x", padx=12, pady=(6 if i == 0 else 0, 6 if last else 0))
+            ctk.CTkLabel(line, text=key, font=(self.font_family, 12, "bold"),
+                         text_color=COLOR_PRIMARY).pack(side="left")
+            ctk.CTkLabel(line, text=value, font=(self.font_family, 15, "bold"),
+                         text_color=COLOR_TEXT).pack(side="right")
+
+        if wifi_source == "auto":
+            small(body1, "이 컴퓨터가 연결된 와이파이입니다", size=11, pady=(6, 0))
+
+        # ── ② 파일 전송 ──
+        _, body2 = step_box(1, 2, "파일 전송")
+        qr_widget(body2, url)
+        small(body2, "QR을 찍고 파일을 올리세요", size=12)
+        small(body2, "노트북은 주소창에 입력", size=12, pady=(8, 0))
+        # 주소가 두 줄로 쪼개지면 잘못 입력하기 쉬우므로 한 줄에 들어가는 크기로 쓴다
+        address = url.replace("http://", "")
         ctk.CTkLabel(
-            addr_frame, text="브라우저 주소창에 입력",
-            font=(self.font_family, 13), text_color=COLOR_TEXT_MUTED
-        ).pack(padx=30, pady=(20, 8))
+            body2, text=address,
+            font=(self.font_family, 14 if len(address) <= 30 else 12, "bold"),
+            text_color=COLOR_PRIMARY, justify="center"
+        ).pack(pady=(2, 0))
 
-        ctk.CTkLabel(
-            addr_frame, text=url.replace("http://", ""),
-            font=(self.font_family, 23, "bold"), text_color=COLOR_PRIMARY,
-            justify="center"
-        ).pack(padx=30, pady=(0, 20))
+        # ── ③ 예, 출력합니다 ──
+        box3, body3 = step_box(2, 3, "예, 출력합니다")
 
-        # ── 도착 알림 ──
-        # 파일이 오면 이 자리에 초록색으로 표시된다
-        status_frame = ctk.CTkFrame(card, fg_color=COLOR_ENTRY_BG, corner_radius=12)
-        status_frame.pack(pady=(0, 16))
-
-        # 여백은 라벨 쪽에 준다.
-        # 프레임에 ipady 를 주면 글자가 위로 치우쳐 보인다.
         status_label = ctk.CTkLabel(
-            status_frame,
-            text="파일을 기다리는 중입니다...",
-            font=(self.font_family, 16),
-            text_color=COLOR_TEXT_MUTED
+            body3,
+            text="파일을 기다리는 중입니다...\n\n파일이 도착하면 여기에\n‘예, 출력합니다’ 버튼이 나옵니다.",
+            font=(self.font_family, 14), text_color=COLOR_TEXT_MUTED,
+            justify="center", wraplength=STEP_W - 36
         )
-        status_label.pack(padx=28, pady=14)
+        status_label.pack(pady=(26, 12))
+
+        # "출력할까요?" 버튼은 파일이 처음 도착할 때 보인다
+        ask_frame = ctk.CTkFrame(body3, fg_color="transparent")
+
+        # ── ④ 출력 ──
+        _, body4 = step_box(3, 4, "출력")
+        small(
+            body4,
+            "출력 정보 확인 화면에서\n부수 · 양면 인쇄를 정하고\n‘출력 시작’을 누르세요.",
+            size=14, color=COLOR_TEXT, pady=(26, 14)
+        )
+        small(body4, "출력물은 바로 챙겨 가세요.", size=13)
+
+        minutes = get_auto_delete_minutes()
+        if minutes > 0:
+            small(body4, f"보낸 파일은 {minutes}분 뒤\n자동으로 삭제됩니다.", size=12, pady=(10, 0))
 
         # 지금까지 받은 파일 경로를 모아둔다 (바로 출력할 때 쓴다)
         received = {"paths": []}
-
-        # "출력할까요?" 버튼은 파일이 처음 도착할 때 만든다
-        ask_frame = ctk.CTkFrame(status_frame, fg_color="transparent")
 
         def on_upload(user_label, paths):
             """
@@ -6736,14 +7306,16 @@ class PrinterKioskApp:
                     return
 
                 status_label.configure(
-                    text=f"파일 {count}개를 받았습니다\n받은 파일을 지금 출력할까요?",
+                    text=f"파일 {count}개를 받았습니다\n지금 출력할까요?",
                     text_color=COLOR_SUCCESS,
-                    font=(self.font_family, 17, "bold")
+                    font=(self.font_family, 16, "bold")
                 )
-                status_frame.configure(fg_color="#EAF7EF")
+                # 지금 할 차례인 ③ 칸을 초록색으로 강조한다
+                box3.configure(border_color=COLOR_SUCCESS, fg_color="#EAF7EF")
+                status_label.configure(fg_color="#EAF7EF")
 
                 if not ask_frame.winfo_ismapped():
-                    ask_frame.pack(padx=28, pady=(0, 16))
+                    ask_frame.pack(pady=(0, 4))
             except Exception:
                 pass
 
@@ -6799,35 +7371,27 @@ class PrinterKioskApp:
             try:
                 ask_frame.pack_forget()
                 status_label.configure(
-                    text=f"파일 {len(received['paths'])}개를 받았습니다",
-                    font=(self.font_family, 17, "bold")
+                    text=f"파일 {len(received['paths'])}개를 받았습니다\n더 보내도 됩니다.",
+                    font=(self.font_family, 16, "bold")
                 )
             except Exception:
                 pass
 
-        # 초록 알림 상자 안이라 버튼도 초록 계열로 맞춘다
+        # 초록 강조 칸 안이라 버튼도 초록 계열로 맞춘다
         ctk.CTkButton(
             ask_frame, text="예, 출력합니다", command=print_received,
-            width=170, height=46, corner_radius=12,
-            font=(self.font_family, 15, "bold"),
+            width=140, height=48, corner_radius=12,
+            font=(self.font_family, 16, "bold"),
             fg_color=COLOR_SUCCESS, hover_color="#1A7A45",
             text_color="white"
-        ).grid(row=0, column=0, padx=6)
+        ).grid(row=0, column=0, padx=(0, 6))
 
         self.secondary_button(
             ask_frame, "아니요", skip_print,
-            width=120, height=46, font_size=15
-        ).grid(row=0, column=1, padx=6)
+            width=76, height=48, font_size=15
+        ).grid(row=0, column=1)
 
         set_upload_notifier(on_upload)
-
-        minutes = get_auto_delete_minutes()
-        notice = "학교 와이파이에 연결되어 있어야 합니다."
-        notice += "\n파일이 도착하면 바로 출력할 수 있습니다."
-        if minutes > 0:
-            notice += f"\n보낸 파일은 {minutes}분 후 자동으로 삭제됩니다."
-
-        self.body_label(card, notice, size=14, muted=True).pack(pady=(0, 22))
 
         # 화면이 바뀔 때 자동으로 정리되도록 지금 세션을 기억해 둔다
         self._share_token = token
@@ -6865,12 +7429,16 @@ class PrinterKioskApp:
             cleanup()
             self.start_screen()
 
-        self.primary_button(
-            card, "파일을 보냈어요 — 출력하러 가기",
-            go_print, width=340, height=56, font_size=18
-        ).pack(pady=(0, 12))
+        bottom = ctk.CTkFrame(card, fg_color="transparent")
+        bottom.pack()
 
-        self.link_button(card, "처음 화면으로", go_home, width=200, height=44).pack()
+        # 파일이 도착했다는 표시를 못 봤어도 바로 넘어갈 수 있게 남겨 둔다
+        self.secondary_button(
+            bottom, "파일을 보냈어요 — 출력하러 가기",
+            go_print, width=300, height=48, font_size=16
+        ).grid(row=0, column=0, padx=8)
+
+        self.link_button(bottom, "처음 화면으로", go_home, width=180, height=44).grid(row=0, column=1, padx=8)
 
     def show_auto_delete_overlay(self):
         """
@@ -7079,8 +7647,69 @@ class PrinterKioskApp:
         self.file_screen(card_code, name, unlimited)
 
     def file_screen(self, card_code, name, unlimited):
+        # 오른쪽 아래 '파일 공유' 버튼을 강조해서 그린다 (build_card 안에서 쓰인다)
+        self._highlight_share_button = True
+
+        # 파일 공유를 누르기 전에 이 컴퓨터의 와이파이 정보를 미리 읽어 둔다 (화면이 멈추지 않게)
+        threading.Thread(target=get_share_wifi, daemon=True).start()
         card = self.build_card()
         self.make_title(card, "파일 선택 화면")
+
+        # ── 파일을 옮기는 두 가지 방법 안내 (크게) ──
+        how = ctk.CTkFrame(card, fg_color=COLOR_USB_NOTICE_BG, corner_radius=18)
+        how.pack(fill="x", pady=(0, 18))
+
+        how_inner = ctk.CTkFrame(how, fg_color="transparent")
+        how_inner.pack(padx=30, pady=(16, 18))
+
+        line1 = ctk.CTkFrame(how_inner, fg_color="transparent")
+        line1.pack()
+
+        ctk.CTkLabel(
+            line1, text="파일을 옮기려면 오른쪽 아래",
+            font=(self.font_family, 23, "bold"), text_color=COLOR_USB_NOTICE_TEXT
+        ).pack(side="left")
+
+        ctk.CTkLabel(
+            line1, text=" 파일 공유 ", corner_radius=8,
+            fg_color=COLOR_PRIMARY, text_color="#FFFFFF",
+            font=(self.font_family, 21, "bold"), height=36
+        ).pack(side="left", padx=8)
+
+        ctk.CTkLabel(
+            line1, text="버튼을 누르거나,",
+            font=(self.font_family, 23, "bold"), text_color=COLOR_USB_NOTICE_TEXT
+        ).pack(side="left")
+
+        ctk.CTkLabel(
+            how_inner, text="모니터 앞 USB 포트에 USB를 삽입하세요.",
+            font=(self.font_family, 23, "bold"), text_color=COLOR_USB_NOTICE_TEXT
+        ).pack(pady=(6, 0))
+
+        ctk.CTkLabel(
+            how_inner, text="USB를 꽂았다면 아래 ‘문서 파일 선택’ → 창 왼쪽 ‘내 PC’ 에서 USB를 고르세요.",
+            font=(self.font_family, 15), text_color=COLOR_USB_NOTICE_SUB
+        ).pack(pady=(8, 0))
+
+        # 공용 USB 안내 — 언제 지워지는지 설정값 그대로 알려 준다
+        usb_minutes = get_shared_usb_minutes()
+        usb_after_print = get_shared_usb_delete_after_print()
+        when = []
+        if usb_after_print:
+            when.append("출력이 끝나면 바로")
+        if usb_minutes > 0:
+            when.append(f"넣은 지 {usb_minutes}분이 지나면")
+        if when:
+            usb_text = ("USB가 없으면 모니터 옆 공용 USB를 쓰세요.  공용 USB의 파일은 "
+                        + " 또는 ".join(when) + " 자동으로 지워집니다.")
+        else:
+            usb_text = "USB가 없으면 모니터 옆 공용 USB를 쓰세요.  다 쓴 파일은 지워 주세요."
+
+        ctk.CTkLabel(
+            how_inner,
+            text=usb_text,
+            font=(self.font_family, 15), text_color=COLOR_USB_NOTICE_SUB
+        ).pack(pady=(2, 0))
 
         limit_mode = get_limit_mode()
         today_count = get_today_count(card_code)
@@ -7109,7 +7738,7 @@ class PrinterKioskApp:
             max_text = f"최대 {max_files}개"
 
         info_card = ctk.CTkFrame(card, fg_color=COLOR_ENTRY_BG, corner_radius=16)
-        info_card.pack(pady=(0, 28), padx=6, ipadx=24, ipady=22)
+        info_card.pack(pady=(0, 18), padx=6, ipadx=24, ipady=12)
 
         student_number = get_student_number(card_code)
 
@@ -7133,7 +7762,7 @@ class PrinterKioskApp:
 
         for label_text, value_text in info_rows:
             row = ctk.CTkFrame(rows_wrap, fg_color="transparent")
-            row.pack(fill="x", pady=4, padx=10)
+            row.pack(fill="x", pady=3, padx=10)
             self.body_label(row, label_text, size=16, muted=True).pack(side="left")
             ctk.CTkLabel(
                 row, text=value_text,
@@ -7144,14 +7773,14 @@ class PrinterKioskApp:
         self.primary_button(
             card, "문서 파일 선택",
             lambda: self.select_files(card_code, name, unlimited),
-            width=320, height=60, font_size=20
-        ).pack(pady=(0, 14))
+            width=320, height=58, font_size=20
+        ).pack(pady=(0, 10))
 
         self.body_label(
             card,
             "지원 형식: PDF, DOC, DOCX, HWP, HWPX, JPG, PNG, PPT, PPTX, CSV, XLS, XLSX, TXT",
             size=14, muted=True
-        ).pack(pady=(0, 24))
+        ).pack(pady=(0, 14))
 
         self.link_button(card, "처음 화면으로", self.start_screen, width=180, height=42).pack()
 
@@ -7159,6 +7788,11 @@ class PrinterKioskApp:
         initial_dir = get_setting("file_open_dir", "")
         if not initial_dir or not os.path.isdir(initial_dir):
             initial_dir = os.path.expanduser("~\\Desktop")
+
+        # 공용 USB 가 꽂혀 있으면 처음부터 그 USB 를 열어 준다 (드라이브를 찾을 필요가 없게)
+        shared_root = find_shared_usb()
+        if shared_root:
+            initial_dir = shared_root
 
         file_paths = filedialog.askopenfilenames(
             title="출력할 파일 선택",
@@ -8239,6 +8873,7 @@ class PrinterKioskApp:
         fail_count = 0
         errors = []
         removed_files = []   # 출력이 끝나 바로 지운 받은 파일
+        usb_removed_files = []   # 출력이 끝나 바로 지운 공용 USB 파일
         delayed_files = []   # 출력이 끝나 삭제를 예약한 받은 파일
         delay_minutes = 0
 
@@ -8282,6 +8917,8 @@ class PrinterKioskApp:
 
                     if result == "deleted":
                         removed_files.append(file_name)
+                    elif result == "usb_deleted":
+                        usb_removed_files.append(file_name)
                     elif result == "scheduled":
                         delayed_files.append(file_name)
                         delay_minutes = delay
@@ -8309,6 +8946,12 @@ class PrinterKioskApp:
         if removed_files:
             message += (
                 f"\n\n파일 공유로 받은 파일 {len(removed_files)}개는\n"
+                "출력이 끝나 바로 삭제했습니다."
+            )
+
+        if usb_removed_files:
+            message += (
+                f"\n\n공용 USB에 있던 파일 {len(usb_removed_files)}개는\n"
                 "출력이 끝나 바로 삭제했습니다."
             )
 
@@ -9048,7 +9691,7 @@ class PrinterKioskApp:
         self.body_label(
             left,
             "학생이 '문서 파일 선택'을 눌렀을 때 열리는 폴더입니다.\n"
-            "비워두면 바탕화면에서 시작합니다.",
+            "비워두면 바탕화면에서 시작합니다. (공용 USB가 꽂혀 있으면 공용 USB)",
             size=13, muted=True
         ).pack(pady=(0, 12))
 
@@ -9059,6 +9702,7 @@ class PrinterKioskApp:
                 dir_entry.insert(0, selected.replace("/", "\\"))
 
         self.secondary_button(left, "폴더 선택", browse_open_dir, width=150, height=42).pack()
+
 
         # ==========================================================
         # 오른쪽 — 받은 파일 보관
@@ -9373,7 +10017,23 @@ class PrinterKioskApp:
 
         ctk.CTkFrame(card, fg_color=COLOR_BORDER, height=1).pack(fill="x", pady=(12, 10))
 
-        self.primary_button(card, "저장", save_limits, width=200, height=52).pack(pady=(0, 8))
+        # 공용 USB 설정은 따로 화면으로 둔다. 이 화면은 이미 꽉 차서
+        # 칸을 더 쌓으면 FHD(125%) 에서 저장 버튼이 잘리므로 저장 버튼 옆에 나란히 둔다.
+        usb_parts = []
+        if get_shared_usb_delete_after_print():
+            usb_parts.append("출력 후")
+        if get_shared_usb_minutes() > 0:
+            usb_parts.append(f"{get_shared_usb_minutes()}분")
+
+        save_row = ctk.CTkFrame(card, fg_color="transparent")
+        save_row.pack(pady=(0, 8))
+        self.primary_button(save_row, "저장", save_limits, width=200, height=52).grid(row=0, column=0, padx=8)
+        self.secondary_button(
+            save_row,
+            "공용 USB 설정" + (f"  ({' · '.join(usb_parts)} 삭제)" if usb_parts else ""),
+            self.shared_usb_screen, width=260, height=52, font_size=15
+        ).grid(row=0, column=1, padx=8)
+
         self.link_button(card, "관리자 메뉴로", self.admin_menu, width=180, height=42).pack()
 
     def printer_setting_screen(self):
@@ -10684,6 +11344,243 @@ class PrinterKioskApp:
             self.root.destroy()
 
         threading.Thread(target=worker, daemon=True).start()
+
+    def shared_usb_screen(self):
+        """
+        공용 USB 설정.
+
+          · 어느 USB 가 공용 USB 인지 지정 / 해제 (USB 맨 위에 숨김 표시 파일을 둔다)
+          · 자동 삭제 시간(분) — 0 이면 시간으로는 지우지 않음
+          · 출력이 끝나면 바로 지우기
+          · 지금 바로 비우기
+
+        표시 파일이 없는 USB(학생 개인 USB)는 어떤 경우에도 건드리지 않는다.
+        """
+        card = self.build_card()
+        self.make_title(card, "공용 USB 설정")
+
+        columns = ctk.CTkFrame(card, fg_color="transparent")
+        columns.pack(pady=(0, 4))
+
+        left = ctk.CTkFrame(columns, fg_color="transparent")
+        left.grid(row=0, column=0, padx=(0, 26), sticky="n")
+
+        ctk.CTkFrame(columns, fg_color=COLOR_BORDER, width=1).grid(row=0, column=1, sticky="ns", pady=6)
+
+        right = ctk.CTkFrame(columns, fg_color="transparent")
+        right.grid(row=0, column=2, padx=(26, 0), sticky="n")
+
+        # ==========================================================
+        # 왼쪽 — 공용 USB 지정
+        # ==========================================================
+        self.body_label(left, "공용 USB 지정", size=20, bold=True).pack(pady=(0, 6))
+        self.body_label(
+            left,
+            "공용으로 둘 USB를 꽂고 아래에서 골라 '지정'을 누르세요.\n"
+            "지정한 USB 안에만 숨김 표시 파일이 생기고,\n"
+            "그 USB의 파일만 자동으로 지워집니다.",
+            size=13, muted=True
+        ).pack(pady=(0, 12))
+
+        status_label = self.body_label(left, "", size=16, bold=True)
+        status_label.pack(pady=(0, 10))
+
+        drive_var = tk.StringVar(value="")
+        drive_menu = ctk.CTkOptionMenu(
+            left, variable=drive_var, values=["(USB 없음)"], width=320, height=42,
+            font=(self.font_family, 15), dropdown_font=(self.font_family, 15),
+            fg_color=COLOR_ENTRY_BG, button_color=COLOR_SECONDARY_BG,
+            button_hover_color=COLOR_SECONDARY_BG_HOVER, text_color=COLOR_TEXT
+        )
+        drive_menu.pack(pady=(0, 10))
+
+        choices = {}
+
+        def refresh_drives():
+            choices.clear()
+            labels = []
+            for root, label, marked in list_usb_candidates():
+                text = f"{root}  {label or '이름 없음'}" + ("  ★ 공용" if marked else "")
+                choices[text] = (root, marked)
+                labels.append(text)
+
+            if not labels:
+                labels = ["(USB 없음)"]
+
+            drive_menu.configure(values=labels)
+            marked_now = [t for t, (_, m) in choices.items() if m]
+            drive_var.set(marked_now[0] if marked_now else labels[0])
+
+            root = find_shared_usb()
+            if root:
+                status_label.configure(text=f"공용 USB: {root}  (꽂혀 있음)", text_color=COLOR_SUCCESS)
+            else:
+                status_label.configure(text="공용 USB가 꽂혀 있지 않습니다", text_color=COLOR_TEXT_MUTED)
+
+        def selected():
+            return choices.get(drive_var.get())
+
+        def count_files(root):
+            try:
+                return sum(1 for _ in _iter_shared_usb_files(root))
+            except Exception:
+                return 0
+
+        def do_mark():
+            pick = selected()
+            if not pick:
+                messagebox.showwarning("안내", "USB를 꽂고 '새로고침'을 누른 뒤 골라 주세요.")
+                return
+            root, marked = pick
+            if marked:
+                messagebox.showinfo("안내", f"{root} 는 이미 공용 USB입니다.")
+                return
+
+            other = find_shared_usb()
+            n = count_files(root)
+            message = (
+                f"{root} 를 공용 USB로 지정합니다.\n\n"
+                f"지금 이 USB 안에 파일이 {n}개 있습니다.\n"
+                "지정하면 이 USB의 파일은 설정한 시간이 지나거나 출력이 끝나면\n"
+                "자동으로 지워집니다.\n\n"
+                "학생이나 선생님의 개인 USB를 지정하지 마세요.\n계속할까요?"
+            )
+            if other and other.upper() != root.upper():
+                message = f"이미 {other} 가 공용 USB로 지정되어 있습니다. 둘 다 공용 USB가 됩니다.\n\n" + message
+
+            if not messagebox.askyesno("공용 USB 지정", message):
+                return
+            try:
+                mark_shared_usb(root)
+            except Exception as e:
+                messagebox.showerror("실패", f"지정하지 못했습니다.\n{e}")
+                return
+            admin_log("공용 USB 지정", root)
+            refresh_drives()
+
+        def do_unmark():
+            pick = selected()
+            if not pick or not pick[1]:
+                messagebox.showinfo("안내", "공용 USB로 지정된 USB를 골라 주세요. (★ 표시)")
+                return
+            root = pick[0]
+            if not messagebox.askyesno(
+                "지정 해제",
+                f"{root} 의 공용 USB 지정을 풉니다.\n안에 있는 파일은 지우지 않습니다. 계속할까요?"
+            ):
+                return
+            try:
+                unmark_shared_usb(root)
+            except Exception as e:
+                messagebox.showerror("실패", f"해제하지 못했습니다.\n{e}")
+                return
+            admin_log("공용 USB 지정 해제", root)
+            refresh_drives()
+
+        def do_empty():
+            root = find_shared_usb()
+            if not root:
+                messagebox.showinfo("안내", "공용 USB가 꽂혀 있지 않습니다.")
+                return
+            n = count_files(root)
+            if n == 0:
+                messagebox.showinfo("안내", "공용 USB가 이미 비어 있습니다.")
+                return
+            if not messagebox.askyesno("지금 비우기", f"공용 USB({root})의 파일 {n}개를 지금 모두 지웁니다.\n계속할까요?"):
+                return
+            removed = 0
+            for path in list(_iter_shared_usb_files(root)):
+                try:
+                    os.remove(path)
+                    removed += 1
+                except OSError:
+                    pass
+            _remove_empty_dirs(root)
+            admin_log("공용 USB 비우기", f"{root} · {removed}개 삭제")
+            messagebox.showinfo("완료", f"파일 {removed}개를 지웠습니다.")
+
+        btns = ctk.CTkFrame(left, fg_color="transparent")
+        btns.pack(pady=(0, 8))
+        self.primary_button(btns, "지정", do_mark, width=100, height=42, font_size=15).grid(row=0, column=0, padx=4)
+        self.secondary_button(btns, "지정 해제", do_unmark, width=110, height=42, font_size=15).grid(row=0, column=1, padx=4)
+        self.secondary_button(btns, "새로고침", refresh_drives, width=100, height=42, font_size=15).grid(row=0, column=2, padx=4)
+
+        self.danger_button(left, "공용 USB 지금 비우기", do_empty, width=200, height=42).pack(pady=(6, 0))
+
+        # ==========================================================
+        # 오른쪽 — 자동 삭제
+        # ==========================================================
+        self.body_label(right, "자동 삭제", size=20, bold=True).pack(pady=(0, 6))
+        self.body_label(
+            right,
+            "앞 학생의 파일이 다음 학생에게 보이지 않도록\n공용 USB의 파일을 자동으로 지웁니다.",
+            size=13, muted=True
+        ).pack(pady=(0, 14))
+
+        after_print_var = tk.IntVar(value=1 if get_shared_usb_delete_after_print() else 0)
+        ctk.CTkCheckBox(
+            right, text="출력이 끝나면 그 파일을 바로 지우기",
+            variable=after_print_var, onvalue=1, offvalue=0,
+            font=(self.font_family, 15), text_color=COLOR_TEXT,
+            fg_color=COLOR_PRIMARY, hover_color=COLOR_PRIMARY_HOVER
+        ).pack(pady=(0, 16))
+
+        minutes_box = ctk.CTkFrame(right, fg_color=COLOR_ENTRY_BG, corner_radius=14)
+        minutes_box.pack(pady=(0, 8), ipadx=14, ipady=10)
+        minutes_box.grid_anchor("center")
+
+        self.body_label(minutes_box, "넣은 뒤 자동 삭제까지", size=14).grid(row=0, column=0, padx=(10, 8), pady=4)
+        minutes_entry = self.make_entry(minutes_box, width=90, height=42, font_size=15)
+        minutes_entry.grid(row=0, column=1, padx=4, pady=4)
+        minutes_entry.insert(0, str(get_shared_usb_minutes()))
+        self.body_label(minutes_box, "분", size=14).grid(row=0, column=2, padx=(4, 10), pady=4)
+
+        quick = ctk.CTkFrame(right, fg_color="transparent")
+        quick.pack(pady=(0, 8))
+
+        def set_minutes(value):
+            minutes_entry.delete(0, tk.END)
+            minutes_entry.insert(0, str(value))
+
+        for i, value in enumerate((10, 15, 30, 60)):
+            self.secondary_button(quick, f"{value}분", lambda v=value: set_minutes(v),
+                                  width=70, height=36, font_size=14).grid(row=0, column=i, padx=3)
+
+        self.body_label(
+            right,
+            "0 으로 두면 시간으로는 지우지 않습니다.\n"
+            "시간은 파일이 USB에 들어온 때부터 셉니다.",
+            size=13, muted=True
+        ).pack(pady=(0, 6))
+
+        def save():
+            text = minutes_entry.get().strip()
+            if not text.isdigit():
+                messagebox.showwarning("입력 오류", "자동 삭제 시간은 0 이상의 숫자(분)로 입력하세요.")
+                return
+            minutes = int(text)
+            after_print = after_print_var.get() == 1
+
+            if minutes == 0 and not after_print:
+                if not messagebox.askyesno(
+                    "확인",
+                    "시간 삭제와 출력 후 삭제를 모두 끄면\n공용 USB의 파일이 지워지지 않고 계속 남습니다.\n그래도 저장할까요?"
+                ):
+                    return
+
+            set_setting("shared_usb_minutes", str(minutes))
+            set_setting("shared_usb_delete_after_print", "1" if after_print else "0")
+            messagebox.showinfo("완료", "공용 USB 설정을 저장했습니다.")
+            self.limit_setting_screen()
+
+        ctk.CTkFrame(card, fg_color=COLOR_BORDER, height=1).pack(fill="x", pady=(14, 12))
+
+        bottom = ctk.CTkFrame(card, fg_color="transparent")
+        bottom.pack()
+        self.primary_button(bottom, "저장", save, width=180, height=48).grid(row=0, column=0, padx=8)
+        self.link_button(bottom, "출력 파일 설정으로", self.limit_setting_screen, width=190, height=42).grid(row=0, column=1, padx=8)
+
+        refresh_drives()
 
     def kiosk_setting_screen(self):
         """
