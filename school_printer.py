@@ -99,7 +99,7 @@ DB_NAME = "school_printer.db"
 # 프로그램이 스스로 업데이트를 확인하는 일은 없다.
 # 관리자가 버튼을 눌렀을 때만 확인한다.
 # -----------------------------
-APP_VERSION = "1.6.11"
+APP_VERSION = "1.6.13"
 GITHUB_REPO = "sicgaonnury/printer"
 DEFAULT_ADMIN_PASSWORD = "1234"
 
@@ -773,6 +773,7 @@ SETTING_LABELS = {
     "admin_mode": "관리자 방식",
     "idle_minutes": "자리 비움 복귀(분)",
     "student_number_format": "학번 형식",
+    "student_number_login": "학번으로 로그인",
     "shared_usb_minutes": "공용 USB 자동 삭제(분)",
     "shared_usb_delete_after_print": "공용 USB 출력 후 삭제",
 }
@@ -784,6 +785,7 @@ _SETTING_VALUE_NAMES = {
     "delete_mode": {"time": "지우지 않음", "print": "바로 지움", "print_delay": "유예 후 지움"},
     "admin_mode": {"single": "단일 비밀번호", "individual": "관리자별 비밀번호"},
     "student_number_format": {"plain": "10101 그대로", "dashed": "1-1-1 → 10101"},
+    "student_number_login": {"0": "막음", "1": "허용"},
     "shared_usb_delete_after_print": {"0": "끔", "1": "켬"},
     "fullscreen": {"0": "끔", "1": "켬"},
     "block_system_keys": {"0": "끔", "1": "켬"},
@@ -906,7 +908,8 @@ ADMIN_CSV_NAME = "admin_list.csv"
 ADMIN_CSV_HEADER = ["이름", "학번", "직함", "권한", "관리자코드", "비밀번호", "비고"]
 REGISTERED_MARK = "(등록됨)"
 
-# 비밀번호 설정 · 관리자 계정 · 작업 기록은 '총괄' 로 적힌 사람들만 쓸 수 있다.
+# 관리자 계정 · 작업 기록 · 메뉴 권한 설정은 '총괄' 로 적힌 사람들만 쓸 수 있다.
+# (나머지 메뉴는 총괄이 '메뉴 권한 설정' 에서 사람마다 정한다)
 ADMIN_ROLE_SUPER = "총괄"
 
 # 명단이 비어 있을 때만 쓰이는 비상 통로. 이 이름들은 총괄로 본다.
@@ -1047,7 +1050,7 @@ def is_super_admin(name):
 
 def admin_can_manage(name=None):
     """
-    총괄 전용 기능(비밀번호 설정 · 관리자 계정 · 작업 기록)을 쓸 수 있는지.
+    총괄 전용 기능(관리자 계정 · 작업 기록 · 메뉴 권한 설정)을 쓸 수 있는지.
 
     단일 방식은 비밀번호가 하나뿐이라 누가 들어왔는지 가릴 수 없으므로 막지 않는다.
     개별 방식에서만 '총괄' 로 적힌 사람들로 제한한다.
@@ -1056,6 +1059,70 @@ def admin_can_manage(name=None):
         return True
 
     return is_super_admin(current_admin() if name is None else name)
+
+
+# -----------------------------
+# 관리자 메뉴 권한 (관리자별 비밀번호 방식에서만 적용)
+#
+# 관리자 메뉴의 버튼마다 누가 쓸 수 있는지 정한다.
+#   · 총괄은 언제나 모든 메뉴를 쓴다 (권한을 정하는 사람이므로)
+#   · 따로 정하지 않은 관리자는 기본값(ADMIN_PERM_DEFAULT)을 따른다
+#   · '관리자 계정 · 작업 기록' 은 권한을 정하는 화면이라 총괄 전용으로 고정한다
+# 저장 위치: 설정 admin_permissions = {"이름": ["users", "logs", ...]}  (JSON)
+# -----------------------------
+ADMIN_PERMISSIONS = [
+    ("users", "이용자 관리"),
+    ("limits", "출력 파일 설정"),
+    ("printer", "프린터 설정"),
+    ("logs", "출력 기록 관리"),
+    ("password", "비밀번호 설정"),
+    ("kiosk", "보호 기능 설정"),
+    ("exit", "프로그램 종료"),
+]
+ADMIN_PERM_LABELS = dict(ADMIN_PERMISSIONS)
+# 예전처럼 총괄이 아닌 관리자는 비밀번호 설정만 빼고 모두 쓸 수 있게 시작한다
+ADMIN_PERM_DEFAULT = ["users", "limits", "printer", "logs", "kiosk", "exit"]
+
+
+def load_admin_permissions():
+    """{이름: [권한 키, ...]} — 설정이 없거나 깨졌으면 빈 사전."""
+    import json
+    try:
+        data = json.loads(get_setting("admin_permissions", "") or "{}")
+    except Exception:
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    valid = set(ADMIN_PERM_LABELS)
+    return {
+        str(name): [k for k in keys if k in valid]
+        for name, keys in data.items() if isinstance(keys, list)
+    }
+
+
+def save_admin_permissions(perms):
+    import json
+    set_setting("admin_permissions", json.dumps(perms, ensure_ascii=False))
+
+
+def admin_permissions_of(name):
+    """이 관리자가 쓸 수 있는 권한 키 목록."""
+    if is_super_admin(name):
+        return [key for key, _ in ADMIN_PERMISSIONS]
+    return load_admin_permissions().get(name, list(ADMIN_PERM_DEFAULT))
+
+
+def admin_has_permission(key, name=None):
+    """
+    지금 들어온 관리자(또는 name)가 이 메뉴를 쓸 수 있는지.
+    단일 비밀번호 방식은 누가 들어왔는지 가릴 수 없으므로 막지 않는다.
+    """
+    if get_admin_mode() != "individual":
+        return True
+    who = current_admin() if name is None else name
+    if not who:
+        return False
+    return key in admin_permissions_of(who)
 
 
 def find_admin_by_password(password):
@@ -1782,11 +1849,23 @@ def delete_shared_usb_file_after_print(path):
     return True
 
 
-def get_student(card_code):
+def student_number_login_allowed():
+    """
+    학생 입력창(첫 화면 · 파일 보내기)에서 학번으로도 들어갈 수 있게 할지.
+    보호 기능 설정에서 켜고 끈다. 기본값은 켜짐(예전과 같은 동작).
+    관리자 화면의 학번 검색에는 영향이 없다.
+    """
+    return get_setting("student_number_login", "1") == "1"
+
+
+def get_student(card_code, allow_number=True):
     """
     학생증 코드로 학생을 조회한다.
     일치하는 학생증 코드가 없으면 같은 값으로 학번 조회를 한 번 더 시도한다.
     (학번으로도 조회가 되는 것은 화면에 안내되지 않는 숨겨진 기능이다.)
+
+    allow_number=False 이면 학번 조회를 하지 않는다.
+    학생 입력창에서는 student_number_login_allowed() 값을 넘긴다.
     """
     normalized = normalize_card_code(card_code)
 
@@ -1802,7 +1881,7 @@ def get_student(card_code):
     )
     row = cur.fetchone()
 
-    if row is None:
+    if row is None and allow_number:
         # 학번 조회는 학번 입력 형식(1-1-1 → 10101)을 따른다
         cur.execute(
             """
@@ -6407,6 +6486,9 @@ class PrinterKioskApp:
         )
 
     def admin_exit_program(self):
+        if not self.require_perm("exit"):
+            return
+
         result = messagebox.askyesno(
             "프로그램 종료",
             "정말 키오스크 프로그램을 종료하시겠습니까?"
@@ -6714,9 +6796,6 @@ class PrinterKioskApp:
                     "--no-default-browser-check",
                     "--disable-features=TranslateUI",
                 ]
-                # 엣지는 키오스크 종류를 정해 줘야 전체화면 키오스크로 뜬다
-                if path in edge_paths:
-                    args.append("--edge-kiosk-type=fullscreen")
                 try:
                     process = subprocess.Popen(args)
                     break
@@ -6747,9 +6826,9 @@ class PrinterKioskApp:
             except Exception:
                 pass
 
-        self.bring_browser_to_front(process.pid)
+        self.bring_browser_to_front(process.pid, process)
 
-    def bring_browser_to_front(self, pid):
+    def bring_browser_to_front(self, pid, process=None):
         """
         방금 띄운 브라우저 창을 찾아 화면 맨 앞으로 올린다.
 
@@ -6796,9 +6875,12 @@ class PrinterKioskApp:
                 except Exception:
                     return
 
-                # 실행한 프로세스가 창을 다른 프로세스에 넘기고 끝난 경우:
-                # 띄우기 전에는 없던 브라우저 창을 대신 찾는다
-                if not found:
+                # 실행한 프로세스가 창을 다른 프로세스에 넘기고 끝난 경우에만:
+                # 띄우기 전에는 없던 브라우저 창을 대신 찾는다.
+                # (실행한 프로세스가 살아 있는데 엉뚱한 창을 맨 앞에 올리면
+                #  진짜 화면이 뒤로 가려져 하얀 화면만 보인다)
+                launcher_done = process is not None and process.poll() is not None
+                if not found and launcher_done:
                     known = getattr(self, "_external_known_hwnds", set())
                     fresh = [h for h in self._list_browser_windows() if h not in known]
                     if fresh:
@@ -6917,14 +6999,22 @@ class PrinterKioskApp:
             return name
 
         EnumWindowsProc = ctypes.WINFUNCTYPE(ctypes.c_bool, wintypes.HWND, wintypes.LPARAM)
+        GW_OWNER = 4
 
         def callback(hwnd, lparam):
+            # 창 제목(GetWindowTextLength)은 그 창에 메시지를 보내서 읽는다.
+            # 다른 프로그램 하나가 멈춰 있으면 여기서 같이 멈춰 화면이 하얗게 굳으므로
+            # 메시지를 보내지 않는 정보(보이는지 · 주인 창 · 실행 파일 · 창 종류)만 쓴다.
             try:
-                if not user32.IsWindowVisible(hwnd) or user32.GetWindowTextLengthW(hwnd) <= 0:
+                if not user32.IsWindowVisible(hwnd) or user32.GetWindow(hwnd, GW_OWNER):
                     return True
                 pid = wintypes.DWORD()
                 user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
-                if exe_name(pid.value) in self.BROWSER_EXE_NAMES:
+                if exe_name(pid.value) not in self.BROWSER_EXE_NAMES:
+                    return True
+                cls = ctypes.create_unicode_buffer(64)
+                user32.GetClassNameW(hwnd, cls, 64)
+                if cls.value == "Chrome_WidgetWin_1":     # 크롬 · 엣지의 브라우저 창
                     result.append(hwnd)
             except Exception:
                 pass
@@ -7093,13 +7183,10 @@ class PrinterKioskApp:
                 entry.focus_set()
                 return
 
-            user = get_student(code)
+            user = get_student(code, allow_number=student_number_login_allowed())
 
             if user is None:
-                messagebox.showerror(
-                    "등록되지 않음",
-                    "등록되지 않은 학생증입니다.\n관리자에게 문의하세요."
-                )
+                messagebox.showerror("등록되지 않음", self.unknown_card_message(code))
                 entry.delete(0, tk.END)
                 entry.focus_set()
                 return
@@ -7593,6 +7680,19 @@ class PrinterKioskApp:
         self.update_scan_mask()
         self.focus_scan_entry()
 
+    def unknown_card_message(self, code):
+        """
+        학생증 코드로 찾지 못했을 때의 안내.
+        학번 로그인이 꺼져 있는데 학번을 넣은 경우라면 학생증을 찍으라고 알려 준다.
+        """
+        if not student_number_login_allowed() and get_student_by_number(code):
+            return (
+                "학번으로는 들어갈 수 없습니다.\n\n"
+                "학생증 뒷면의 바코드를 스캔하거나,\n"
+                "바코드 아래 적힌 학생증 코드를 입력하세요."
+            )
+        return f"등록되지 않은 학생증 코드입니다.\n관리자에게 문의하세요.\n\n입력 코드: {code}"
+
     def check_user(self):
         raw_code = self.card_entry.get().strip()
         card_code = normalize_card_code(raw_code)
@@ -7609,13 +7709,11 @@ class PrinterKioskApp:
             self.admin_menu()
             return
 
-        user = get_student(card_code)
+        # 학번으로 들어오는 것은 보호 기능 설정에서 허용했을 때만
+        user = get_student(card_code, allow_number=student_number_login_allowed())
 
         if not user:
-            messagebox.showerror(
-                "인증 실패",
-                f"등록되지 않은 학생증 코드입니다.\n\n입력 코드: {card_code}"
-            )
+            messagebox.showerror("인증 실패", self.unknown_card_message(card_code))
             self.reset_scan_entry()
             return
 
@@ -9099,9 +9197,31 @@ class PrinterKioskApp:
         admin_log("권한 없음", "총괄 전용 기능에 접근 시도")
         messagebox.showwarning(
             "총괄 관리자 전용",
-            "비밀번호 설정 · 관리자 계정 · 작업 기록은\n"
+            "관리자 계정 · 작업 기록 · 메뉴 권한 설정은\n"
             "총괄 관리자만 사용할 수 있습니다.\n\n"
             f"총괄 관리자: {top or '명단에서 정해지지 않음'}"
+        )
+        self.admin_menu()
+        return False
+
+    def require_perm(self, key):
+        """
+        이 메뉴를 쓸 권한이 있는지 확인한다. (메뉴 버튼 말고 다른 길로 들어오는 것도 막는다)
+        없으면 안내하고 관리자 메뉴로 돌려보낸 뒤 False 를 돌려준다.
+        """
+        if not admin_session_active():
+            self.admin_login_screen()
+            return False
+
+        if admin_has_permission(key):
+            return True
+
+        label = ADMIN_PERM_LABELS.get(key, key)
+        admin_log("권한 없음", f"{label} 접근 시도")
+        messagebox.showwarning(
+            "권한 없음",
+            f"'{label}' 은(는) 사용할 권한이 없습니다.\n\n"
+            "권한은 총괄 관리자가 '관리자 계정 · 작업 기록 → 메뉴 권한 설정' 에서 정합니다."
         )
         self.admin_menu()
         return False
@@ -9126,30 +9246,31 @@ class PrinterKioskApp:
             top = describe_super_admins(limit=2)
             self.body_label(
                 card,
-                "비밀번호 설정 · 관리자 계정 · 작업 기록은 총괄 관리자만 쓸 수 있습니다"
+                "잠긴 메뉴는 권한이 없는 메뉴입니다 · 권한은 총괄 관리자가 정합니다"
                 + (f" · 총괄: {top}" if top else ""),
                 size=13, muted=True
             ).pack(pady=(0, 14))
 
         buttons = [
-            ("이용자 관리", self.user_manage_screen),
-            ("출력 파일 설정", self.limit_setting_screen),
-            ("프린터 설정", self.printer_setting_screen),
-            ("출력 기록 관리", self.log_manage_screen),
-            ("비밀번호 설정", self.change_admin_password_screen),
-            ("보호 기능 설정", self.kiosk_setting_screen),
+            ("users", "이용자 관리", self.user_manage_screen),
+            ("limits", "출력 파일 설정", self.limit_setting_screen),
+            ("printer", "프린터 설정", self.printer_setting_screen),
+            ("logs", "출력 기록 관리", self.log_manage_screen),
+            ("password", "비밀번호 설정", self.change_admin_password_screen),
+            ("kiosk", "보호 기능 설정", self.kiosk_setting_screen),
         ]
 
         grid_frame = ctk.CTkFrame(card, fg_color="transparent")
         grid_frame.pack(pady=(0, 24))
 
-        for i, (text, cmd) in enumerate(buttons):
+        for i, (key, text, cmd) in enumerate(buttons):
             row, col = divmod(i, 2)
             btn = self.secondary_button(
                 grid_frame, text, cmd, width=340, height=64, font_size=18
             )
-            if text == "비밀번호 설정" and not can_manage:
-                btn.configure(state="disabled", text="비밀번호 설정 (총괄 전용)")
+            # 권한이 없는 메뉴는 잠근다 (관리자별 비밀번호 방식에서만)
+            if not admin_has_permission(key):
+                btn.configure(state="disabled", text=f"{text}  🔒")
             btn.grid(row=row, column=col, padx=10, pady=10)
 
         # 관리자 방식 · 명단 · 작업 기록 (두 칸을 합친 넓은 버튼)
@@ -9165,9 +9286,16 @@ class PrinterKioskApp:
         bottom_frame.pack()
 
         self.link_button(bottom_frame, "처음 화면으로", self.start_screen, width=200).grid(row=0, column=0, padx=10)
-        self.danger_button(bottom_frame, "프로그램 종료", self.admin_exit_program, width=200).grid(row=0, column=1, padx=10)
+        exit_btn = self.danger_button(bottom_frame, "프로그램 종료", self.admin_exit_program, width=200)
+        if not admin_has_permission("exit"):
+            exit_btn.configure(state="disabled", text="프로그램 종료  🔒",
+                               fg_color=COLOR_SECONDARY_BG, text_color_disabled=COLOR_TEXT_MUTED)
+        exit_btn.grid(row=0, column=1, padx=10)
 
     def user_manage_screen(self):
+        if not self.require_perm("users"):
+            return
+
         card = self.build_card()
         self.make_title(card, "이용자 관리")
 
@@ -9580,6 +9708,9 @@ class PrinterKioskApp:
           왼쪽 : 출력 제한 · 파일 선택 기본 폴더
           오른쪽: 받은 파일 보관 (다운로드 폴더 · 자동 삭제)
         """
+        if not self.require_perm("limits"):
+            return
+
         card = self.build_card()
         self.make_title(card, "출력 파일 설정")
 
@@ -10037,6 +10168,9 @@ class PrinterKioskApp:
         self.link_button(card, "관리자 메뉴로", self.admin_menu, width=180, height=42).pack()
 
     def printer_setting_screen(self):
+        if not self.require_perm("printer"):
+            return
+
         card = self.build_card()
         self.make_title(card, "프린터 설정")
 
@@ -10144,6 +10278,9 @@ class PrinterKioskApp:
         self.link_button(card, "관리자 메뉴로", self.admin_menu, width=180, height=42).pack(pady=(10, 0))
 
     def log_manage_screen(self):
+        if not self.require_perm("logs"):
+            return
+
         card = self.build_card()
         self.make_title(card, "출력 기록 관리")
 
@@ -10176,6 +10313,9 @@ class PrinterKioskApp:
         self.link_button(card, "관리자 메뉴로", self.admin_menu, width=180, height=42).pack()
 
     def log_export_screen(self):
+        if not self.require_perm("logs"):
+            return
+
         card = self.build_card()
         self.make_title(card, "출력 기록 CSV 내보내기")
 
@@ -10533,7 +10673,7 @@ class PrinterKioskApp:
         messagebox.showinfo("완료", "전체 출력 기록을 초기화했습니다.")
 
     def change_admin_password_screen(self):
-        if not self.require_manage_rights():
+        if not self.require_perm("password"):
             return
 
         card = self.build_card()
@@ -10745,7 +10885,7 @@ class PrinterKioskApp:
         top_admin = describe_super_admins(limit=3)
         self.body_label(
             right,
-            "'권한' 칸에 '총괄' 이라고 적은 사람만 이 화면과 비밀번호 설정을 쓸 수 있습니다 (여러 명 가능)"
+            "'권한' 칸에 '총괄' 이라고 적은 사람만 이 화면을 쓸 수 있습니다 (여러 명 가능) · 메뉴별 권한은 아래 '메뉴 권한 설정'"
             + (f"\n지금 총괄: {top_admin}" if top_admin else "\n아직 총괄이 정해지지 않았습니다 (명단 맨 윗줄이 총괄이 됩니다)"),
             size=13, muted=True
         ).pack(pady=(0, 8))
@@ -10826,7 +10966,170 @@ class PrinterKioskApp:
             target()
 
         self.primary_button(bottom, "작업 기록 보기", lambda: leave(self.admin_log_screen), width=200, height=48).grid(row=0, column=0, padx=8)
-        self.link_button(bottom, "관리자 메뉴로", lambda: leave(self.admin_menu), width=180).grid(row=0, column=1, padx=8)
+        self.secondary_button(bottom, "메뉴 권한 설정", lambda: leave(self.admin_permission_screen), width=200, height=48).grid(row=0, column=1, padx=8)
+        self.link_button(bottom, "관리자 메뉴로", lambda: leave(self.admin_menu), width=180).grid(row=0, column=2, padx=8)
+
+    def admin_permission_screen(self):
+        """
+        관리자별 메뉴 권한 설정. (총괄 전용)
+
+        관리자 명단의 사람마다 관리자 메뉴 버튼을 쓸 수 있는지 체크한다.
+        총괄은 언제나 전부 쓸 수 있어 바꿀 수 없다.
+        '관리자 계정 · 작업 기록' 은 총괄 전용으로 고정이라 표에 없다.
+        """
+        if not self.require_manage_rights():
+            return
+
+        card = self.build_card()
+        self.make_title(card, "메뉴 권한 설정")
+
+        if get_admin_mode() != "individual":
+            self.body_label(
+                card,
+                "지금은 '단일 비밀번호' 방식이라 누가 들어왔는지 구분할 수 없어 모든 메뉴가 열려 있습니다.\n"
+                "메뉴 권한은 '관리자별 비밀번호' 방식에서 적용됩니다. (아래에서 미리 정해 둘 수는 있습니다)",
+                size=14, muted=True
+            ).pack(pady=(0, 12))
+        else:
+            self.body_label(
+                card,
+                "체크한 메뉴만 쓸 수 있습니다. 총괄은 언제나 모든 메뉴를 씁니다.\n"
+                "'관리자 계정 · 작업 기록' 은 총괄 전용입니다.",
+                size=14, muted=True
+            ).pack(pady=(0, 12))
+
+        # 명단 순서대로 (카드 01 부터)
+        roles = list_admin_roles()
+        profiles = list_admin_profiles()
+        names = sorted(roles, key=lambda n: (roles[n][1] or 9999, n))
+        names = [n for n in names if n not in FALLBACK_ADMIN_NAMES]
+        supers = set(super_admin_names())
+        saved = load_admin_permissions()
+
+        if not names:
+            self.body_label(
+                card, "관리자 명단이 비어 있습니다. 관리자 계정 화면에서 명단을 먼저 등록하세요.", size=16
+            ).pack(pady=(10, 20))
+            self.link_button(card, "관리자 계정으로", self.admin_account_screen, width=200, height=44).pack()
+            return
+
+        NAME_W, COL_W = 250, 92
+
+        table = ctk.CTkFrame(card, fg_color=COLOR_CARD, corner_radius=12,
+                             border_width=1, border_color=COLOR_BORDER)
+        table.pack(pady=(0, 10))
+
+        # 머리줄
+        head = ctk.CTkFrame(table, fg_color=COLOR_SECONDARY_BG, corner_radius=0)
+        head.pack(fill="x", padx=1, pady=(1, 0))
+        ctk.CTkLabel(head, text="관리자", width=NAME_W, anchor="w",
+                     font=(self.font_family, 14, "bold"), text_color=COLOR_TEXT
+                     ).grid(row=0, column=0, padx=(20, 0), pady=8)
+
+        vars_by_name = {}
+
+        def toggle_column(key):
+            """머리줄을 누르면 그 메뉴를 (총괄이 아닌) 모두 켜거나 모두 끈다."""
+            boxes = [v[key] for n, v in vars_by_name.items() if n not in supers]
+            if not boxes:
+                return
+            turn_on = not all(b.get() == 1 for b in boxes)
+            for b in boxes:
+                b.set(1 if turn_on else 0)
+
+        for c, (key, label) in enumerate(ADMIN_PERMISSIONS, start=1):
+            ctk.CTkButton(
+                head, text=label.replace(" ", "\n", 1) if len(label) > 5 else label,
+                width=COL_W, height=40, corner_radius=8,
+                font=(self.font_family, 12, "bold"),
+                fg_color="transparent", hover_color=COLOR_SECONDARY_BG_HOVER,
+                text_color=COLOR_TEXT, command=lambda k=key: toggle_column(k)
+            ).grid(row=0, column=c, padx=1, pady=4)
+
+        # 본문 (사람이 많으면 스크롤)
+        # 높이를 너무 키우면 FHD(125%) 에서 아래 버튼이 잘린다
+        body = ctk.CTkScrollableFrame(table, fg_color=COLOR_CARD, width=NAME_W + COL_W * len(ADMIN_PERMISSIONS) + 40,
+                                      height=min(310, 46 * len(names)))
+        body.pack(padx=1, pady=(0, 1))
+
+        for r, name in enumerate(names):
+            number, title = profiles.get(name, ("", ""))
+            is_super = name in supers
+            shown = f"{number} {name}".strip() + (f" · {title}" if title else "")
+
+            row_bg = COLOR_PRIMARY_SOFT if is_super else (COLOR_CARD if r % 2 == 0 else COLOR_ENTRY_BG)
+            line = ctk.CTkFrame(body, fg_color=row_bg, corner_radius=8)
+            line.pack(fill="x", pady=1)
+
+            ctk.CTkLabel(
+                line, text=shown + ("  (총괄)" if is_super else ""), width=NAME_W, anchor="w",
+                font=(self.font_family, 14, "bold" if is_super else "normal"),
+                text_color=COLOR_PRIMARY if is_super else COLOR_TEXT
+            ).grid(row=0, column=0, padx=(12, 0), pady=6)
+
+            current = set(admin_permissions_of(name)) if is_super else set(saved.get(name, ADMIN_PERM_DEFAULT))
+            vars_by_name[name] = {}
+
+            for c, (key, _) in enumerate(ADMIN_PERMISSIONS, start=1):
+                var = tk.IntVar(value=1 if (is_super or key in current) else 0)
+                vars_by_name[name][key] = var
+                box = ctk.CTkCheckBox(
+                    line, text="", variable=var, onvalue=1, offvalue=0, width=24,
+                    checkbox_width=24, checkbox_height=24,
+                    fg_color=COLOR_PRIMARY, hover_color=COLOR_PRIMARY_HOVER
+                )
+                # 총괄은 바꿀 수 없다 (언제나 전부 허용)
+                if is_super:
+                    box.configure(state="disabled")
+                # 체크 상자를 칸 한가운데에 둬서 위 메뉴 이름과 줄을 맞춘다
+                side = (COL_W - 24) // 2 + 1
+                box.grid(row=0, column=c, padx=(side, side), pady=4)
+
+        def apply_default():
+            for name, boxes in vars_by_name.items():
+                if name in supers:
+                    continue
+                for key, var in boxes.items():
+                    var.set(1 if key in ADMIN_PERM_DEFAULT else 0)
+
+        def save():
+            new = {}
+            changes = []
+            for name, boxes in vars_by_name.items():
+                if name in supers:
+                    continue
+                keys = [k for k, _ in ADMIN_PERMISSIONS if boxes[k].get() == 1]
+                new[name] = keys
+                before = saved.get(name, ADMIN_PERM_DEFAULT)
+                if set(before) != set(keys):
+                    added = [ADMIN_PERM_LABELS[k] for k in keys if k not in before]
+                    removed = [ADMIN_PERM_LABELS[k] for k in before if k not in keys]
+                    part = name
+                    if added:
+                        part += " +" + ", ".join(added)
+                    if removed:
+                        part += " -" + ", ".join(removed)
+                    changes.append(part)
+
+            # 명단에서 빠진 사람의 기록은 정리한다
+            save_admin_permissions(new)
+            if changes:
+                admin_log("메뉴 권한 변경", " / ".join(changes)[:500])
+            messagebox.showinfo("완료", "메뉴 권한을 저장했습니다." + ("" if changes else "\n(바뀐 내용 없음)"))
+            self.admin_account_screen()
+
+        bottom = ctk.CTkFrame(card, fg_color="transparent")
+        bottom.pack(pady=(4, 0))
+        self.primary_button(bottom, "저장", save, width=180, height=48).grid(row=0, column=0, padx=8)
+        self.secondary_button(bottom, "기본값으로", apply_default, width=150, height=48).grid(row=0, column=1, padx=8)
+        self.link_button(bottom, "관리자 계정으로", self.admin_account_screen, width=180, height=44).grid(row=0, column=2, padx=8)
+
+        self.body_label(
+            card,
+            "메뉴 이름(맨 위 칸)을 누르면 그 메뉴를 모두 켜거나 모두 끕니다.  "
+            "기본값: 비밀번호 설정만 빼고 모두 허용",
+            size=12, muted=True
+        ).pack(pady=(8, 0))
 
     def admin_log_screen(self):
         """누가 · 언제 · 무엇을 했는지 보는 화면."""
@@ -10920,6 +11223,9 @@ class PrinterKioskApp:
           왼쪽 : 등록된 일정 목록 + 삭제 버튼
           오른쪽: 새 일정 추가
         """
+        if not self.require_perm("kiosk"):
+            return
+
         card = self.build_card()
         self.make_title(card, "자동 종료 일정 관리")
 
@@ -11356,6 +11662,9 @@ class PrinterKioskApp:
 
         표시 파일이 없는 USB(학생 개인 USB)는 어떤 경우에도 건드리지 않는다.
         """
+        if not self.require_perm("limits"):
+            return
+
         card = self.build_card()
         self.make_title(card, "공용 USB 설정")
 
@@ -11591,6 +11900,9 @@ class PrinterKioskApp:
           왼쪽 : 화면 · Windows 잠금
           오른쪽: 자동 종료 · 프로그램 업데이트
         """
+        if not self.require_perm("kiosk"):
+            return
+
         card = self.build_card()
         self.make_title(card, "보호 기능 설정")
 
@@ -11747,8 +12059,35 @@ class PrinterKioskApp:
 
 
         # ==========================================================
-        # 오른쪽 — 자동 종료
+        # 오른쪽 — 학생 로그인
         # ==========================================================
+        self.body_label(right, "학생 로그인", size=20, bold=True).pack(pady=(0, 10))
+
+        number_login_var = tk.IntVar(value=1 if student_number_login_allowed() else 0)
+
+        ctk.CTkCheckBox(
+            right,
+            text="학번으로도 로그인 허용 (학생 입력창)",
+            variable=number_login_var,
+            onvalue=1,
+            offvalue=0,
+            font=(self.font_family, 15),
+            text_color=COLOR_TEXT,
+            fg_color=COLOR_PRIMARY,
+            hover_color=COLOR_PRIMARY_HOVER
+        ).pack(pady=(0, 8))
+
+        self.body_label(
+            right,
+            "끄면 첫 화면과 파일 보내기에서 학생증 코드로만 들어옵니다.\n"
+            "(남의 학번으로 대신 출력하는 것을 막을 수 있습니다)\n"
+            "관리자 화면의 학번 검색은 그대로 됩니다.",
+            size=13, muted=True
+        ).pack(pady=(0, 16))
+
+        # ── 오른쪽 — 자동 종료 ──
+        ctk.CTkFrame(right, fg_color=COLOR_BORDER, height=1).pack(fill="x", pady=(0, 18))
+
         self.body_label(right, "자동 종료", size=20, bold=True).pack(pady=(0, 10))
 
         schedules = list_shutdown_schedules()
@@ -11805,6 +12144,9 @@ class PrinterKioskApp:
 
             key_value = "1" if key_block_var.get() == 1 else "0"
             set_setting("block_system_keys", key_value)
+
+            # 학번 로그인 허용 여부 (바뀌면 작업 기록에 '설정 변경 · 학번으로 로그인' 으로 남는다)
+            set_setting("student_number_login", "1" if number_login_var.get() == 1 else "0")
 
             key_message = ""
             if key_value == "1":
