@@ -99,7 +99,7 @@ DB_NAME = "school_printer.db"
 # 프로그램이 스스로 업데이트를 확인하는 일은 없다.
 # 관리자가 버튼을 눌렀을 때만 확인한다.
 # -----------------------------
-APP_VERSION = "1.6.13"
+APP_VERSION = "1.6.15"
 GITHUB_REPO = "sicgaonnury/printer"
 DEFAULT_ADMIN_PASSWORD = "1234"
 
@@ -776,9 +776,11 @@ SETTING_LABELS = {
     "student_number_login": "학번으로 로그인",
     "shared_usb_minutes": "공용 USB 자동 삭제(분)",
     "shared_usb_delete_after_print": "공용 USB 출력 후 삭제",
+    "umbrella_url": "우산 웹앱 주소",
+    "umbrella_key": "우산 웹앱 연결 키",
 }
 
-SECRET_SETTINGS = {"admin_password", "admin_barcode"}
+SECRET_SETTINGS = {"admin_password", "admin_barcode", "umbrella_key"}
 
 _SETTING_VALUE_NAMES = {
     "limit_mode": {"count": "횟수", "pages": "용지 장수"},
@@ -1075,13 +1077,14 @@ ADMIN_PERMISSIONS = [
     ("limits", "출력 파일 설정"),
     ("printer", "프린터 설정"),
     ("logs", "출력 기록 관리"),
+    ("umbrella", "우산 연체자 명단"),
     ("password", "비밀번호 설정"),
     ("kiosk", "보호 기능 설정"),
     ("exit", "프로그램 종료"),
 ]
 ADMIN_PERM_LABELS = dict(ADMIN_PERMISSIONS)
 # 예전처럼 총괄이 아닌 관리자는 비밀번호 설정만 빼고 모두 쓸 수 있게 시작한다
-ADMIN_PERM_DEFAULT = ["users", "limits", "printer", "logs", "kiosk", "exit"]
+ADMIN_PERM_DEFAULT = ["users", "limits", "printer", "logs", "umbrella", "kiosk", "exit"]
 
 
 def load_admin_permissions():
@@ -2918,12 +2921,15 @@ def parse_bool(value, default=0):
     if value is None:
         return default
 
-    text = str(value).strip().lower()
+    # '사용 가능' · '사용 중지' 처럼 띄어 쓴 값도 같은 뜻으로 읽는다
+    text = str(value).strip().lower().replace(" ", "")
 
-    if text in ["1", "true", "yes", "y", "o", "on", "예", "네", "사용", "무제한", "가능"]:
+    if text in ["1", "true", "yes", "y", "o", "on", "예", "네", "사용", "무제한", "가능",
+                "사용가능", "활성", "활성화"]:
         return 1
 
-    if text in ["0", "false", "no", "n", "x", "off", "아니오", "아니요", "미사용", "중지", "비활성", "불가"]:
+    if text in ["0", "false", "no", "n", "x", "off", "아니오", "아니요", "미사용", "중지", "비활성", "불가",
+                "사용중지", "사용불가", "비활성화"]:
         return 0
 
     return default
@@ -3018,8 +3024,9 @@ def import_users_from_file(path):
         "unlimited", "unlimited_print", "무제한", "무제한출력", "무제한 출력"
     ])
 
+    # '사용상태' 는 이 프로그램이 내보내는 CSV 의 실제 열 이름이다
     active_idx = find_column_index(headers, [
-        "active", "enabled", "사용", "상태", "활성화", "사용여부"
+        "active", "enabled", "사용상태", "사용", "상태", "활성화", "사용여부"
     ])
 
     if code_idx is None or name_idx is None:
@@ -3272,6 +3279,28 @@ def _csv_stamp(path):
         return None
 
 
+def _remember_sync_stamp(path):
+    """
+    프로그램이 마지막으로 맞춰 둔 CSV 상태를 기억한다. (메모리 + DB 설정)
+    DB 에도 남겨야, 프로그램이 꺼져 있는 동안 누가 CSV 를 고쳤는지 다음에 켤 때 알 수 있다.
+    """
+    stamp = _csv_stamp(path)
+    _sync_csv_state["stamp"] = stamp
+    try:
+        set_setting("user_csv_stamp", "" if stamp is None else f"{stamp[0]}:{stamp[1]}")
+    except Exception:
+        pass
+
+
+def _saved_sync_stamp():
+    raw = get_setting("user_csv_stamp", "")
+    try:
+        mtime, size = raw.split(":")
+        return (int(mtime), int(size))
+    except Exception:
+        return None
+
+
 def write_sync_csv():
     """
     지금 명단을 연동용 CSV 로 내보낸다.
@@ -3288,8 +3317,23 @@ def write_sync_csv():
         # 두 개로 갈라진다.
         ok = False
 
-    _sync_csv_state["stamp"] = _csv_stamp(path)
+    _sync_csv_state["write_failed"] = not ok
+
+    if ok:
+        _remember_sync_stamp(path)
+    else:
+        # 못 썼으면 기억해 둔 상태는 그대로 둔다. 파일 쪽이 DB 보다 오래된 상태이므로,
+        # 다음에 켤 때 이 파일을 '밖에서 고친 것' 으로 잘못 읽어 들이지 않게 하려는 것이다.
+        _sync_csv_state["stamp"] = _csv_stamp(path)
     return ok
+
+
+def sync_csv_edited_while_closed():
+    """프로그램이 꺼져 있는 동안 CSV 가 고쳐졌는지. (기억해 둔 상태와 지금 파일이 다르면)"""
+    path = get_sync_csv_path()
+    current = _csv_stamp(path)
+    saved = _saved_sync_stamp()
+    return current is not None and saved is not None and current != saved
 
 
 def merge_legacy_sync_csv():
@@ -3557,6 +3601,965 @@ def fetch_report_status(direct=False):
             return data
 
     return None
+
+
+# -----------------------------
+# 우산 미반납 명단 — 학급별 (관리자 메뉴 → 우산 연체자 명단)
+#
+# 우산 대여 웹앱의 '우산 미반납 명단'(OverdueDoc) 과 같은 내용 · 같은 모양으로
+# 학급별 명단을 인쇄하거나 PDF 로 저장한다.
+#
+# 데이터
+#   1) 우산 웹앱에서 바로 — 웹 명단이 쓰는 getOverdueByClass() 결과를 그대로 받는다.
+#      (Apps Script 에 printerOverdueJson_ 함수와 doGet 첫 줄 한 줄을 붙여야 한다)
+#      주소?action=printer_overdue&key=연결키&lost=1&all=0
+#   2) 파일에서 — '대여기록' 시트를 CSV · XLSX 로 내려받아 고르면
+#      getOverdueByClass() 와 같은 규칙으로 프로그램이 직접 묶는다.
+#      (A 대여일시 · B 학번 · C 이름 · D 우산코드 · E 상태 · F 반납일시 · G 반납예정일 · H 연체일수)
+#
+# 인쇄 모양
+#   웹 명단의 HTML · CSS 를 그대로 써서 엣지(또는 크롬)로 PDF 를 만든다. → 웹과 똑같다.
+#   브라우저로 만들지 못하면 PyMuPDF 로 비슷한 모양을 직접 그린다.
+# -----------------------------
+UMBRELLA_STATUS_ACTIVE = "대여중"
+UMBRELLA_STATUS_LOST = ("분실/파손", "분실")
+UMBRELLA_SID_GRADE_LEN = 1
+UMBRELLA_SID_CLASS_LEN = 2
+
+# 웹 명단 안내 박스에 들어가는 분실·파손 신고 폼 QR (우산 Code.gs 의 REPORT_QR_PNG_B64)
+# 웹에서 받아 오면 웹 값을 쓰고, 파일에서 불러올 때만 이 값을 쓴다.
+UMBRELLA_REPORT_QR_PNG_B64 = (
+    "iVBORw0KGgoAAAANSUhEUgAAAWgAAAFoAQAAAABSnlx4AAACIElEQVR42u2bzU4DMRCDR7z/Oxt1kxk7pT1U8h6ovKASaLh8HTmenxQ+eSq7s/u/7a71XP/4+LGW1wq9XjvwU5882f3i6Q9ogUXzxcUa870+mhC08G6+G/eOc/S78154O3k3YazIVlUJ7zvi+yC/5by21oS3Xb95XKKjvRfRbyfv8Sdvv+JPjLyfveT4lR3ysiUEPXrSEb5fxxOOZdk6E4ImPVGjXYJ/nOEyLSHo029x3xhTKGY8euLjTcBVkl2inoI/BB3nZaMdAUHXUsD8J3ri9N9FE14iIFyEtzO/ZImqpErV0T+pfXh7/HcxsYRYxFGZRh/etny+pHLCoxOHoIe3zZ/Q8h1VWUA1J7xd/kQEW1IeevBKfdDJG/JKIZ+8cmpZ4e3y32dyzwYPJrFP/cSrJ9CW8Yg6dSX67dSTOTFLsvujmRl/4u3vSDuNzpveeyEPQU98a9FKbTcTzOSX1vyS1ZPTE57TEuHtOi9L+gqci5C8vhLf1vzyOBZRUoPVwZQQ9PUvW73/jKRI7hOC1v7lUQvEjKF0yzi8rfMn6lJejxSGt4c3ZFZwzkiGO4sqIWjsz/OYHGdYOLeGoHG+SoBPjqmN+sS3eX5wGvQtJVC5iR/032+Q0JZyOH8NQev8t8zW15HhV+L7jvskTGyk09Nb0t+54T4J2MwUOzh/DEHn/QZmNlXHQHjuk9x1vwGq4jUDbvEn99xvyB3g7P6u3b9hynpFfHWN0AAAAABJRU5ErkJggg=="
+)
+
+
+def parse_loose_datetime(value):
+    """
+    시트에서 나오는 여러 날짜 모양을 datetime 으로 바꾼다. 못 읽으면 None.
+      2026-11-20 15:45:00 · 2026. 11. 20 오후 3:45:00 · 2026/11/20 · 11/20/2026 15:45
+    """
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value
+    if isinstance(value, date):
+        return datetime(value.year, value.month, value.day)
+
+    text = str(value).strip()
+    if not text:
+        return None
+
+    y = m = d = None
+    found = re.search(r"(\d{4})\s*[-./년]\s*(\d{1,2})\s*[-./월]\s*(\d{1,2})", text)
+    if found:
+        y, m, d = (int(x) for x in found.groups())
+    else:
+        found = re.search(r"(\d{1,2})/(\d{1,2})/(\d{4})", text)            # 11/20/2026
+        if found:
+            m, d, y = (int(x) for x in found.groups())
+
+    if y is None:
+        return None
+
+    hh = mm = ss = 0
+    rest = text[found.end():]
+    t = re.search(r"(\d{1,2}):(\d{2})(?::(\d{2}))?", rest)
+    if t:
+        hh, mm = int(t.group(1)), int(t.group(2))
+        ss = int(t.group(3) or 0)
+        low = rest.lower()
+        if ("오후" in rest or "pm" in low) and hh < 12:
+            hh += 12
+        elif ("오전" in rest or "am" in low) and hh == 12:
+            hh = 0
+
+    try:
+        return datetime(y, m, d, hh, mm, ss)
+    except ValueError:
+        return None
+
+
+def _umb_fmt_date(value):
+    """Code.gs fmtDate 와 같게: yyyy-MM-dd, 없으면 '-'."""
+    parsed = parse_loose_datetime(value)
+    if parsed is None:
+        text = str(value or "").strip()
+        return text or "-"
+    return parsed.strftime("%Y-%m-%d")
+
+
+def umbrella_parse_student_id(student_id):
+    """Code.gs parseStudentId: 5자리 학번 → (학년, 반, 번호). 아니면 None."""
+    s = str(student_id or "").strip()
+    if not re.fullmatch(r"\d{5}", s):
+        return None
+    g = int(s[:UMBRELLA_SID_GRADE_LEN])
+    c = int(s[UMBRELLA_SID_GRADE_LEN:UMBRELLA_SID_GRADE_LEN + UMBRELLA_SID_CLASS_LEN])
+    n = int(s[UMBRELLA_SID_GRADE_LEN + UMBRELLA_SID_CLASS_LEN:])
+    if not g or not c:
+        return None
+    return g, c, n
+
+
+def umbrella_add_business_days(day, n):
+    """Code.gs addBusinessDays: 토·일을 빼고 n일 뒤."""
+    added = 0
+    while added < n:
+        day = day + timedelta(days=1)
+        if day.weekday() < 5:
+            added += 1
+    return day
+
+
+def umbrella_korean_date(day):
+    """'2026년 11월 17일(화)'"""
+    return f"{day.year}년 {day.month}월 {day.day}일({'월화수목금토일'[day.weekday()]})"
+
+
+def _umb_cell_text(value):
+    if value is None:
+        return ""
+    if isinstance(value, float) and value.is_integer():
+        return str(int(value))
+    return str(value).strip()
+
+
+def umbrella_report_from_rows(rows, include_lost=True, include_all=False, now=None):
+    """
+    '대여기록' 시트 줄들(머리글 뺀 것) → 웹 getOverdueByClass() 와 같은 모양의 명단.
+    """
+    now = now or datetime.now()
+    entries = []
+
+    for r in rows:
+        r = list(r) + [""] * (12 - len(r))
+        status = _umb_cell_text(r[4])
+        sid = _umb_cell_text(r[1])
+        if not sid and not _umb_cell_text(r[2]):
+            continue
+
+        od_text = _umb_cell_text(r[7])
+        try:
+            od = int(float(od_text)) if od_text else 0
+        except ValueError:
+            od = 0
+        due = parse_loose_datetime(r[6])
+        active = status == UMBRELLA_STATUS_ACTIVE
+        # CSV 에 연체일수 수식 값이 비어 있으면 시트 수식과 같게 계산 (TODAY - INT(반납예정일))
+        if active and not od_text and due is not None:
+            od = max(0, (now.date() - due.date()).days)
+
+        lost = status in UMBRELLA_STATUS_LOST
+        is_overdue = active and od > 0
+        if not (is_overdue or (include_all and active) or (include_lost and lost)):
+            continue
+
+        p = umbrella_parse_student_id(sid)
+        entries.append({
+            "studentId": sid,
+            "name": _umb_cell_text(r[2]),
+            "umbrellaCode": _umb_cell_text(r[3]),
+            "borrowedAt": _umb_fmt_date(r[0]),
+            "dueDate": _umb_fmt_date(r[6]),
+            "overdueDays": od,
+            "kind": "분실/파손" if lost else ("연체" if is_overdue else "대여중"),
+            "borrowOperator": _umb_cell_text(r[10]) or "-",
+            "grade": p[0] if p else None,
+            "classNo": p[1] if p else None,
+            "number": p[2] if p else None,
+        })
+
+    groups = {}
+    for e in entries:
+        key = "zz-unknown" if e["grade"] is None else f"{e['grade']}-{e['classNo']}"
+        if key not in groups:
+            groups[key] = {
+                "key": key, "grade": e["grade"], "classNo": e["classNo"],
+                "label": "학번 확인 필요" if e["grade"] is None else f"{e['grade']}학년 {e['classNo']}반",
+                "rows": [],
+            }
+        groups[key]["rows"].append(e)
+
+    classes = sorted(groups.values(), key=lambda g: (g["grade"] is None, g["grade"] or 0, g["classNo"] or 0))
+    for g in classes:
+        g["rows"].sort(key=lambda e: (e["number"] or 999, e["studentId"]))
+
+    return {
+        "ok": True,
+        "asOf": now.strftime("%Y-%m-%d %H:%M"),
+        "asOfDate": now.strftime("%Y-%m-%d"),
+        "deadline": umbrella_korean_date(umbrella_add_business_days(now.date(), 2)),
+        "reportQr": "data:image/png;base64," + UMBRELLA_REPORT_QR_PNG_B64,
+        "includeAll": bool(include_all),
+        "total": len(entries),
+        "overdueCount": sum(1 for e in entries if e["kind"] == "연체"),
+        "activeCount": sum(1 for e in entries if e["kind"] == "대여중"),
+        "lostCount": sum(1 for e in entries if e["kind"] == "분실/파손"),
+        "classes": classes,
+    }
+
+
+def umbrella_read_rental_file(path):
+    """'대여기록' 시트를 내려받은 CSV / XLSX → 머리글을 뺀 줄들."""
+    ext = os.path.splitext(path)[1].lower()
+
+    if ext in (".xlsx", ".xlsm"):
+        if openpyxl is None:
+            raise RuntimeError("XLSX 를 읽는 기능(openpyxl)이 없습니다. CSV 로 내려받아 주세요.")
+        wb = openpyxl.load_workbook(path, data_only=True, read_only=True)
+        try:
+            ws = None
+            for sheet in wb.worksheets:
+                if sheet.title.strip() == "대여기록":
+                    ws = sheet
+                    break
+            ws = ws or wb.worksheets[0]
+            values = [list(r) for r in ws.iter_rows(values_only=True)]
+        finally:
+            wb.close()
+    else:
+        for enc in ("utf-8-sig", "cp949", "utf-16"):
+            try:
+                with open(path, "r", encoding=enc, newline="") as f:
+                    values = list(csv.reader(f))
+                break
+            except (UnicodeDecodeError, UnicodeError):
+                continue
+        else:
+            raise RuntimeError("파일의 글자 인코딩을 알 수 없습니다. UTF-8 CSV 로 저장해 주세요.")
+
+    if not values:
+        raise RuntimeError("파일이 비어 있습니다.")
+
+    head = [str(v or "").replace(" ", "") for v in values[0]]
+    if len(head) < 8 or "학번" not in head[1] or ("상태" not in head[4] and "대여" not in "".join(head)):
+        raise RuntimeError(
+            "'대여기록' 시트 모양이 아닙니다.\n"
+            "A 대여일시 · B 학번 · C 이름 · D 우산코드 · E 상태 · F 반납일시 · G 반납예정일 · H 연체일수\n"
+            "순서인 '대여기록' 시트를 CSV 나 XLSX 로 내려받아 골라 주세요.\n\n"
+            f"이 파일의 첫 줄: {', '.join(str(v) for v in values[0][:8])}"
+        )
+    return values[1:]
+
+
+def umbrella_fetch_report(url, key, include_lost=True, include_all=False, timeout=30):
+    """우산 웹앱에서 웹 명단과 같은 getOverdueByClass() 결과를 받아 온다."""
+    import json
+    import ssl
+    import urllib.parse
+    import urllib.request
+
+    if not url:
+        raise RuntimeError("연결 주소가 없습니다. '연결 설정' 에서 우산 웹앱 /exec 주소를 넣어 주세요.")
+
+    params = {"action": "printer_overdue", "key": key or "",
+              "lost": "1" if include_lost else "0", "all": "1" if include_all else "0"}
+    base = url.split("?")[0]
+    target = base + "?" + urllib.parse.urlencode(params)
+
+    context = ssl.create_default_context()
+    context.check_hostname = False
+    context.verify_mode = ssl.CERT_NONE
+    request = urllib.request.Request(target, headers={"User-Agent": "SchoolPrinterKiosk", "Cache-Control": "no-cache"})
+
+    try:
+        with urllib.request.urlopen(request, context=context, timeout=timeout) as response:
+            raw = response.read().decode("utf-8", errors="replace")
+    except Exception as e:
+        raise RuntimeError(f"우산 웹앱에 연결하지 못했습니다.\n인터넷 연결과 주소를 확인해 주세요.\n\n({e})")
+
+    try:
+        data = json.loads(raw)
+    except Exception:
+        if "<html" in raw[:2000].lower() or "<!doctype" in raw[:200].lower():
+            raise RuntimeError(
+                "명단 대신 웹 페이지가 왔습니다.\n"
+                "· Code.gs 에 printerOverdueJson_ 함수를 붙이고 doGet 첫 줄을 넣었는지\n"
+                "· 배포 관리에서 '새 버전' 으로 다시 배포했는지\n"
+                "· 배포 '액세스 권한' 이 '모든 사용자' 인지 확인해 주세요."
+            )
+        raise RuntimeError("받은 내용을 읽지 못했습니다.")
+
+    if not isinstance(data, dict) or not data.get("ok"):
+        err = str(data.get("error", "")) if isinstance(data, dict) else ""
+        if err == "key":
+            raise RuntimeError("연결 키가 맞지 않습니다. Code.gs 의 PRINTER_EXPORT_KEY 와 같게 넣어 주세요.")
+        raise RuntimeError(f"우산 웹앱이 오류를 돌려주었습니다. {err}".strip())
+
+    data.setdefault("classes", [])
+    data.setdefault("total", sum(len(g.get("rows", [])) for g in data["classes"]))
+    for key_name in ("overdueCount", "activeCount", "lostCount"):
+        data.setdefault(key_name, 0)
+    data.setdefault("asOf", datetime.now().strftime("%Y-%m-%d %H:%M"))
+    data.setdefault("asOfDate", datetime.now().strftime("%Y-%m-%d"))
+    data.setdefault("deadline", umbrella_korean_date(umbrella_add_business_days(date.today(), 2)))
+    data.setdefault("reportQr", "data:image/png;base64," + UMBRELLA_REPORT_QR_PNG_B64)
+    data["includeAll"] = bool(data.get("includeAll"))
+    return data
+
+
+def umbrella_visible_classes(report, class_key=""):
+    classes = report.get("classes") or []
+    if not class_key:
+        return classes
+    return [g for g in classes if g.get("key") == class_key]
+
+
+def umbrella_doc_title(report):
+    return "우산 미반납 학생 명단" if report.get("includeAll") else "우산 연체 학생 명단"
+
+
+def umbrella_status_text(report):
+    """웹 명단 위쪽 안내 줄과 같은 문장."""
+    if not report.get("total"):
+        return "✅ 현재 미반납 우산이 없습니다."
+    return (
+        f"총 {report['total']}명 · {len(report['classes'])}개 학급 "
+        f"(연체 {report['overdueCount']}"
+        + (f" · 대여중 {report['activeCount']}" if report.get("includeAll") else "")
+        + f" · 분실/파손 {report['lostCount']}) · 기준 {report['asOf']} · 반납 기한 {report['deadline']}"
+    )
+
+
+# ---- 웹 명단(OverdueDoc.html) 과 같은 HTML ----
+UMBRELLA_DOC_CSS = r"""
+    button, input, select, textarea { font-family: inherit; }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: #E9ECF1;
+      font-family: "Pretendard Variable", Pretendard, -apple-system, BlinkMacSystemFont, system-ui, "Apple SD Gothic Neo", "Malgun Gothic", sans-serif;
+      color: #101418;
+    }
+    .sheets { padding: 20px; display: flex; flex-direction: column; align-items: center; gap: 20px; }
+    .sheet {
+      width: 210mm; min-height: 297mm;
+      background: #FFFFFF; padding: 16mm 15mm 14mm;
+      box-shadow: 0 2px 10px rgba(0,0,0,.12);
+      display: flex; flex-direction: column;
+    }
+    .sheetTop { display: flex; align-items: flex-end; justify-content: space-between; gap: 16px; }
+    .docTitle { font-size: 25px; font-weight: 800; letter-spacing: -0.02em; }
+    .asOf { font-size: 12px; color: #5A6675; text-align: right; line-height: 1.6; }
+    .rule { height: 3px; background: #101418; margin: 10px 0 0; }
+    .classLine { display: flex; align-items: baseline; gap: 12px; margin: 18px 0 12px; }
+    .classLabel { font-size: 34px; font-weight: 800; letter-spacing: -0.02em; }
+    .classCount { font-size: 16px; font-weight: 700; color: #1346C8; }
+    table { width: 100%; border-collapse: collapse; }
+    th, td { border: 1px solid #C8D0DA; padding: 7px 8px; font-size: 13px; }
+    th { background: #F2F5F9; font-weight: 700; font-size: 12px; color: #3A4654; }
+    td.c { text-align: center; }
+    td.sid { font-weight: 700; letter-spacing: 0.02em; }
+    td.nm { font-weight: 700; }
+    .tagLost { color: #B4341F; font-weight: 700; }
+    .tagOver { color: #3A4654; }
+    .foot { margin-top: 22px; font-size: 11.5px; color: #5A6675; line-height: 1.7; }
+    .sign { margin-top: 14px; font-size: 13px; color: #101418; }
+    .sumGrid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; margin: 14px 0 18px; }
+    .sumGrid.four { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+    .tagActive { color: #1346C8; font-weight: 700; }
+    .notice {
+      border: 2.5px solid #101418; border-radius: 10px; padding: 16px 18px;
+      font-size: 18px; font-weight: 700; line-height: 1.6; color: #101418; margin-bottom: 8px;
+    }
+    .notice b { color: #B4341F; }
+    .notice { display: flex; align-items: center; gap: 16px; word-break: keep-all; }
+    .notice b, .notice .nw { white-space: nowrap; }
+    .notice .txt { flex: 1 1 auto; min-width: 0; }
+    .notice .sub {
+      display: block; margin-top: 8px; padding-top: 8px; border-top: 1px solid #C8D0DA;
+      font-size: 14px; font-weight: 500; color: #3A4654;
+    }
+    .notice .qr {
+      flex: 0 0 auto; display: flex; flex-direction: column; align-items: center; gap: 4px;
+      padding-left: 16px; border-left: 1px solid #C8D0DA;
+    }
+    .notice .qr img { width: 96px; height: 96px; image-rendering: pixelated; display: block; }
+    .notice .qr span { font-size: 12px; font-weight: 800; color: #101418; white-space: nowrap; }
+    .sumBox { border: 2px solid #101418; border-radius: 10px; padding: 14px 16px; }
+    .sumBox .k { font-size: 12px; font-weight: 700; color: #1346C8; }
+    .sumBox .v { font-size: 30px; font-weight: 800; line-height: 1.2; }
+    .empty { padding: 60px 20px; text-align: center; color: #5A6675; font-size: 16px; }
+    @page { size: A4 portrait; margin: 14mm 14mm 12mm; }
+    @media print {
+      body { background: #fff; }
+      .sheets { padding: 0; gap: 0; display: block; }
+      .sheet {
+        width: auto; min-height: 0; padding: 0; box-shadow: none;
+        page-break-after: always; break-after: page;
+      }
+      .sheet:last-child { page-break-after: auto; break-after: auto; }
+      .sheet { display: block; }
+      .foot { margin-top: 24px; }
+      tr, .notice, .sumBox, .sheetTop, .classLine { break-inside: avoid; page-break-inside: avoid; }
+      .sheetTop, .rule, .classLine { break-after: avoid; page-break-after: avoid; }
+      thead { display: table-header-group; }
+    }
+    * { -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+"""
+
+
+def _umb_esc(value):
+    import html as _html
+    return _html.escape("" if value is None else str(value), quote=True)
+
+
+def _umb_num_text(value):
+    if value is None or value == "":
+        return ""
+    try:
+        f = float(value)
+        return str(int(f)) if f.is_integer() else str(value)
+    except (TypeError, ValueError):
+        return str(value)
+
+
+def _umb_kind_class(kind):
+    if kind == "연체":
+        return "tagOver"
+    if kind == "대여중":
+        return "tagActive"
+    return "tagLost"
+
+
+def _umb_notice_html(report):
+    qr_src = report.get("reportQr") or ""
+    qr = (f'<div class="qr"><img src="{_umb_esc(qr_src)}" alt="분실·파손 신고 QR"><span>분실·파손 신고</span></div>'
+          if qr_src else "")
+    return (
+        '<div class="notice"><div class="txt">'
+        f'연체된 우산은 <b>{_umb_esc(report.get("deadline"))}</b>까지 정파원(미술실 건물) 3층 화장실 옆 바구니에 반납해 주세요.'
+        '<span class="sub"><span class="nw">※ 분실 · 파손 시에는 '
+        + ("오른쪽 QR로 신고해 주세요." if qr else "학생회로 알려주세요.")
+        + '</span>　<span class="nw">문의 · 인스타그램 @sichs_gaonnury</span></span></div>'
+        + qr + '</div>'
+    )
+
+
+def _umb_summary_sheet(report, classes):
+    show_active = report.get("includeAll")
+
+    def cnt(rows, kind):
+        return sum(1 for r in rows if r.get("kind") == kind)
+
+    body = ""
+    for g in classes:
+        rows = g.get("rows") or []
+        lost = cnt(rows, "분실/파손")
+        names = ", ".join(
+            (f"{_umb_num_text(r.get('number'))}. " if r.get("number") else "") + _umb_esc(r.get("name"))
+            for r in rows
+        )
+        body += (
+            "<tr>"
+            f'<td class="nm">{_umb_esc(g.get("label"))}</td>'
+            f'<td class="c">{len(rows)}</td>'
+            f'<td class="c">{cnt(rows, "연체")}</td>'
+            + (f'<td class="c">{cnt(rows, "대여중")}</td>' if show_active else "")
+            + '<td class="c">' + (f'<span class="tagLost">{lost}</span>' if lost else "0") + '</td>'
+            f"<td>{names}</td>"
+            "</tr>"
+        )
+
+    all_rows = [r for g in classes for r in (g.get("rows") or [])]
+    return (
+        '<div class="sheet">'
+        '<div class="sheetTop">'
+        f'<div class="docTitle">{umbrella_doc_title(report)} · 요약</div>'
+        f'<div class="asOf">기준 {_umb_esc(report.get("asOf"))}<br>가온누리 학생회</div>'
+        '</div>'
+        '<div class="rule"></div>'
+        f'<div class="sumGrid{" four" if show_active else ""}">'
+        f'<div class="sumBox"><div class="k">전체</div><div class="v">{len(all_rows)}명</div></div>'
+        f'<div class="sumBox"><div class="k">연체</div><div class="v">{cnt(all_rows, "연체")}명</div></div>'
+        + (f'<div class="sumBox"><div class="k">대여중(기한 전)</div><div class="v">{cnt(all_rows, "대여중")}명</div></div>'
+           if show_active else "")
+        + f'<div class="sumBox"><div class="k">분실/파손</div><div class="v">{cnt(all_rows, "분실/파손")}명</div></div>'
+        '</div>'
+        '<table><thead><tr>'
+        '<th style="width:20%">학급</th><th style="width:9%">인원</th><th style="width:9%">연체</th>'
+        + ('<th style="width:11%">대여중</th>' if show_active else "")
+        + '<th style="width:11%">분실/파손</th><th>명단</th>'
+        '</tr></thead>'
+        f'<tbody>{body}</tbody></table>'
+        f'<div class="foot">반납 기한 · {_umb_esc(report.get("deadline"))}　|　학급별 상세 명단은 다음 장부터 한 학급씩 이어집니다.</div>'
+        '</div>'
+    )
+
+
+def _umb_class_sheet(report, g):
+    body = ""
+    for r in g.get("rows") or []:
+        kind = r.get("kind")
+        body += (
+            "<tr>"
+            f'<td class="c">{_umb_num_text(r.get("number")) if r.get("number") else "-"}</td>'
+            f'<td class="c sid">{_umb_esc(r.get("studentId"))}</td>'
+            f'<td class="nm">{_umb_esc(r.get("name"))}</td>'
+            f'<td class="c">#{_umb_esc(r.get("umbrellaCode"))}</td>'
+            f'<td class="c">{_umb_esc(r.get("dueDate"))}</td>'
+            f'<td class="c">{(_umb_num_text(r.get("overdueDays")) + "일") if kind == "연체" else "-"}</td>'
+            f'<td class="c {_umb_kind_class(kind)}">{_umb_esc(kind)}</td>'
+            "</tr>"
+        )
+    return (
+        '<div class="sheet">'
+        '<div class="sheetTop">'
+        f'<div class="docTitle">{umbrella_doc_title(report)}</div>'
+        f'<div class="asOf">기준 {_umb_esc(report.get("asOf"))}<br>가온누리 학생회</div>'
+        '</div>'
+        '<div class="rule"></div>'
+        '<div class="classLine">'
+        f'<span class="classLabel">{_umb_esc(g.get("label"))}</span>'
+        f'<span class="classCount">{len(g.get("rows") or [])}명</span>'
+        '</div>'
+        '<table><thead><tr>'
+        '<th style="width:8%">번호</th><th style="width:16%">학번</th><th style="width:18%">이름</th>'
+        '<th style="width:12%">우산</th><th style="width:18%">반납예정일</th><th style="width:12%">연체</th>'
+        '<th style="width:16%">구분</th>'
+        '</tr></thead>'
+        f'<tbody>{body}</tbody></table>'
+        f'<div class="foot">{_umb_notice_html(report)}</div>'
+        '</div>'
+    )
+
+
+def umbrella_report_html(report, class_key="", summary=True):
+    """웹 명단의 인쇄 창과 같은 HTML 문서."""
+    classes = umbrella_visible_classes(report, class_key)
+    sheets = ""
+    if summary and len(classes) > 1:
+        sheets += _umb_summary_sheet(report, classes)
+    for g in classes:
+        sheets += _umb_class_sheet(report, g)
+    if not sheets:
+        sheets = '<div class="empty">표시할 미반납 기록이 없습니다.</div>'
+
+    title = f"{umbrella_doc_title(report)} {report.get('asOfDate', '')}"
+    return (
+        '<!DOCTYPE html><html lang="ko"><head><meta charset="utf-8">'
+        f"<title>{_umb_esc(title)}</title>"
+        '<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/orioncactus/pretendard@v1.3.9/dist/web/variable/pretendardvariable-dynamic-subset.min.css">'
+        f"<style>{UMBRELLA_DOC_CSS}</style></head><body>"
+        f'<div class="sheets">{sheets}</div>'
+        "</body></html>"
+    )
+
+
+def find_pdf_browser():
+    """HTML → PDF 에 쓸 엣지 / 크롬 실행 파일."""
+    candidates = []
+    for env in ("PROGRAMFILES(X86)", "PROGRAMFILES", "LOCALAPPDATA"):
+        base = os.environ.get(env)
+        if base:
+            candidates += [
+                os.path.join(base, "Microsoft", "Edge", "Application", "msedge.exe"),
+                os.path.join(base, "Google", "Chrome", "Application", "chrome.exe"),
+            ]
+    candidates += [
+        r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+        r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
+        r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+        r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+    ]
+    extra = os.environ.get("SCHOOL_PRINTER_PDF_BROWSER")   # 시험용
+    if extra:
+        candidates.insert(0, extra)
+    for path in candidates:
+        if path and os.path.exists(path):
+            return path
+    return None
+
+
+def umbrella_html_to_pdf(html_text, out_path, timeout=60):
+    """
+    엣지(크롬)를 화면 없이 띄워 HTML 을 PDF 로 인쇄한다. 웹 명단의 '인쇄' 와 같은 엔진이라 모양이 같다.
+    성공하면 True.
+    """
+    browser = find_pdf_browser()
+    if not browser:
+        return False
+
+    import pathlib
+    work = tempfile.mkdtemp(prefix="umbrella_pdf_")
+    html_path = os.path.join(work, "overdue.html")
+    with open(html_path, "w", encoding="utf-8") as f:
+        f.write(html_text)
+
+    try:
+        if os.path.exists(out_path):
+            os.remove(out_path)
+    except Exception:
+        pass
+
+    cmd = [
+        browser,
+        "--headless=new",
+        "--disable-gpu",
+        "--no-first-run",
+        "--no-default-browser-check",
+        "--disable-extensions",
+        f"--user-data-dir={os.path.join(work, 'profile')}",
+        "--no-pdf-header-footer",
+        "--print-to-pdf-no-header",
+        "--run-all-compositor-stages-before-draw",
+        "--virtual-time-budget=8000",       # 웹 글꼴을 받을 시간
+        f"--print-to-pdf={out_path}",
+        pathlib.Path(html_path).as_uri(),
+    ]
+    if os.name != "nt":
+        cmd.insert(1, "--no-sandbox")    # 윈도우가 아닌 곳(시험 환경)에서만
+    try:
+        subprocess.run(cmd, capture_output=True, timeout=timeout,
+                       creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    except Exception:
+        pass
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+    return os.path.exists(out_path) and os.path.getsize(out_path) > 1000
+
+
+def _find_korean_font_file(bold=False):
+    windir = os.environ.get("WINDIR", r"C:\Windows")
+    if bold:
+        names = [
+            os.path.join(windir, "Fonts", "malgunbd.ttf"),
+            os.path.join(windir, "Fonts", "NanumGothicBold.ttf"),
+            "/usr/share/fonts/truetype/pretendard/Pretendard-Bold.ttf",
+            "/usr/share/fonts/truetype/nanum/NanumGothicBold.ttf",
+        ]
+    else:
+        names = [
+            os.path.join(windir, "Fonts", "malgun.ttf"),
+            os.path.join(windir, "Fonts", "NanumGothic.ttf"),
+            "/usr/share/fonts/truetype/pretendard/Pretendard-Regular.ttf",
+            "/usr/share/fonts/truetype/nanum/NanumGothic.ttf",
+        ]
+    for path in names:
+        if os.path.exists(path):
+            return path
+    return None
+
+
+def umbrella_report_pdf_fitz(report, out_path, class_key="", summary=True):
+    """
+    브라우저를 쓸 수 없을 때: 웹 명단과 같은 배치로 PyMuPDF 로 직접 그린다.
+    (글꼴 · 간격이 아주 조금 다를 수 있다)
+    """
+    if fitz is None:
+        raise RuntimeError("PDF 를 만드는 기능이 없어 명단을 만들 수 없습니다.")
+
+    import base64
+
+    regular = _find_korean_font_file()
+    bold = _find_korean_font_file(bold=True) or regular
+    f_reg = fitz.Font(fontfile=regular) if regular else fitz.Font("korea")
+    f_bold = fitz.Font(fontfile=bold) if bold else f_reg
+
+    def rgb(hex_color):
+        hex_color = hex_color.lstrip("#")
+        return tuple(int(hex_color[i:i + 2], 16) / 255 for i in (0, 2, 4))
+
+    INK, MUTED, LINE, HEAD_BG, HEAD_TXT = rgb("101418"), rgb("5A6675"), rgb("C8D0DA"), rgb("F2F5F9"), rgb("3A4654")
+    BLUE, RED = rgb("1346C8"), rgb("B4341F")
+    PX = 0.75                                    # CSS px → pt
+    MM = 72 / 25.4
+    W, H = fitz.paper_size("a4")
+    L, R, T, B = 14 * MM, W - 14 * MM, 14 * MM, H - 12 * MM
+    CW = R - L
+
+    qr_bytes = None
+    qr_src = str(report.get("reportQr") or "")
+    if "base64," in qr_src:
+        try:
+            qr_bytes = base64.b64decode(qr_src.split("base64,", 1)[1])
+        except Exception:
+            qr_bytes = None
+
+    doc = fitz.open()
+
+    def new_page():
+        page = doc.new_page(width=W, height=H)
+        page.insert_font(fontname="R", fontfile=regular) if regular else None
+        page.insert_font(fontname="B", fontfile=bold) if bold else None
+        return page
+
+    def fn(is_bold):
+        if regular:
+            return "B" if is_bold else "R"
+        return "korea"
+
+    def text(page, x, y, s, size, is_bold=False, color=INK):
+        page.insert_text((x, y), str(s), fontname=fn(is_bold), fontsize=size, color=color)
+
+    def width_of(s, size, is_bold=False):
+        return (f_bold if is_bold else f_reg).text_length(str(s), fontsize=size)
+
+    def wrap(s, size, max_w, is_bold=False):
+        lines, cur = [], ""
+        for token in re.split(r"(\s+)", str(s)):
+            if width_of(cur + token, size, is_bold) <= max_w:
+                cur += token
+                continue
+            if cur.strip():
+                lines.append(cur.rstrip())
+                cur = token.lstrip()
+            else:
+                cur = token
+            while width_of(cur, size, is_bold) > max_w and len(cur) > 1:
+                cut = len(cur)
+                while cut > 1 and width_of(cur[:cut], size, is_bold) > max_w:
+                    cut -= 1
+                lines.append(cur[:cut])
+                cur = cur[cut:]
+        if cur.strip():
+            lines.append(cur.rstrip())
+        return lines or [""]
+
+    def header(page, title):
+        y = T
+        title_size = 25 * PX
+        text(page, L, y + title_size, title, title_size, True)
+        as1, as2 = f"기준 {report.get('asOf', '')}", "가온누리 학생회"
+        s = 12 * PX
+        text(page, R - width_of(as1, s), y + title_size - s * 1.6, as1, s, color=MUTED)
+        text(page, R - width_of(as2, s), y + title_size, as2, s, color=MUTED)
+        y += title_size + 10 * PX + 4
+        page.draw_rect(fitz.Rect(L, y, R, y + 3 * PX), color=None, fill=INK)
+        return y + 3 * PX
+
+    def table(page, y, cols, rows, head_size=12 * PX, body_size=13 * PX, wrap_last=False, on_new_page=None):
+        """cols: [(제목, 폭비율, 가운데?)] · rows: [[(글자, 굵게?, 색)], ...]"""
+        widths = [CW * w for _, w, _ in cols]
+        pad_x, pad_y = 8 * PX, 7 * PX
+
+        def draw_head(page, y):
+            h = head_size * 1.25 + pad_y * 2
+            x = L
+            for (label, _, _), w in zip(cols, widths):
+                page.draw_rect(fitz.Rect(x, y, x + w, y + h), color=LINE, fill=HEAD_BG, width=0.75)
+                tw = width_of(label, head_size, True)
+                text(page, x + (w - tw) / 2, y + pad_y + head_size, label, head_size, True, HEAD_TXT)
+                x += w
+            return y + h
+
+        y = draw_head(page, y)
+        for row in rows:
+            cells = []
+            for (value, is_bold, color), (_, _, center), w in zip(row, cols, widths):
+                lines = wrap(value, body_size, w - pad_x * 2, is_bold) if (wrap_last and not center) else [str(value)]
+                cells.append((lines, is_bold, color, center))
+            h = max(len(c[0]) for c in cells) * body_size * 1.3 + pad_y * 2
+            if y + h > B:
+                page = new_page()
+                y = T
+                if on_new_page:
+                    y = on_new_page(page)
+                y = draw_head(page, y)
+            x = L
+            for (lines, is_bold, color, center), w in zip(cells, widths):
+                page.draw_rect(fitz.Rect(x, y, x + w, y + h), color=LINE, width=0.75)
+                ty = y + pad_y + body_size
+                for line in lines:
+                    tx = x + (w - width_of(line, body_size, is_bold)) / 2 if center else x + pad_x
+                    text(page, tx, ty, line, body_size, is_bold, color)
+                    ty += body_size * 1.3
+                x += w
+            y += h
+        return page, y
+
+    def notice(page, y):
+        size, sub_size = 18 * PX, 14 * PX
+        qr_w = (96 + 16 + 16) * PX if qr_bytes else 0
+        pad = 16 * PX
+        txt_w = CW - pad * 2 - qr_w
+        deadline = str(report.get("deadline", ""))
+        main = f"연체된 우산은 {deadline}까지 정파원(미술실 건물) 3층 화장실 옆 바구니에 반납해 주세요."
+        lines = wrap(main, size, txt_w, True)
+        sub = "※ 분실 · 파손 시에는 " + ("오른쪽 QR로 신고해 주세요." if qr_bytes else "학생회로 알려주세요.") \
+              + "　문의 · 인스타그램 @sichs_gaonnury"
+        sub_lines = wrap(sub, sub_size, txt_w)
+        text_h = len(lines) * size * 1.6 + 8 * PX * 2 + len(sub_lines) * sub_size * 1.6
+        box_h = max(text_h, (96 + 4 + 16) * PX if qr_bytes else 0) + pad * 2
+        if y + box_h > B:
+            page = new_page()
+            y = T
+        page.draw_rect(fitz.Rect(L, y, R, y + box_h), color=INK, width=2.5 * PX, radius=10 * PX / min(CW, box_h))
+        ty = y + pad + (box_h - pad * 2 - text_h) / 2 + size * 1.25
+        for line in lines:
+            # 반납 기한은 빨간색
+            if deadline and deadline in line:
+                before, after = line.split(deadline, 1)
+                x = L + pad
+                text(page, x, ty, before, size, True)
+                x += width_of(before, size, True)
+                text(page, x, ty, deadline, size, True, RED)
+                x += width_of(deadline, size, True)
+                text(page, x, ty, after, size, True)
+            else:
+                text(page, L + pad, ty, line, size, True)
+            ty += size * 1.6
+        sep_y = ty - size * 1.6 + size * 0.45 + 8 * PX
+        page.draw_line((L + pad, sep_y), (L + pad + txt_w, sep_y), color=LINE, width=0.75)
+        ty = sep_y + 8 * PX + sub_size * 1.2
+        for line in sub_lines:
+            text(page, L + pad, ty, line, sub_size, False, HEAD_TXT)
+            ty += sub_size * 1.6
+        if qr_bytes:
+            qx = R - pad - 96 * PX
+            page.draw_line((qx - 16 * PX, y + pad), (qx - 16 * PX, y + box_h - pad), color=LINE, width=0.75)
+            qy = y + (box_h - (96 + 4 + 12) * PX) / 2
+            page.insert_image(fitz.Rect(qx, qy, qx + 96 * PX, qy + 96 * PX), stream=qr_bytes)
+            label = "분실·파손 신고"
+            ls = 12 * PX
+            text(page, qx + (96 * PX - width_of(label, ls, True)) / 2, qy + 96 * PX + 4 * PX + ls, label, ls, True)
+        return page, y + box_h
+
+    classes = umbrella_visible_classes(report, class_key)
+    title = umbrella_doc_title(report)
+
+    if summary and len(classes) > 1:
+        page = new_page()
+        y = header(page, title + " · 요약") + 14 * PX
+        show_active = report.get("includeAll")
+        all_rows = [r for g in classes for r in g.get("rows") or []]
+
+        def cnt(rows, kind):
+            return sum(1 for r in rows if r.get("kind") == kind)
+
+        boxes = [("전체", len(all_rows)), ("연체", cnt(all_rows, "연체"))]
+        if show_active:
+            boxes.append(("대여중(기한 전)", cnt(all_rows, "대여중")))
+        boxes.append(("분실/파손", cnt(all_rows, "분실/파손")))
+        gap = 10 * PX
+        bw = (CW - gap * (len(boxes) - 1)) / len(boxes)
+        bh = (14 * 2 + 12 * 1.3 + 30 * 1.2) * PX
+        for i, (k, v) in enumerate(boxes):
+            x = L + i * (bw + gap)
+            page.draw_rect(fitz.Rect(x, y, x + bw, y + bh), color=INK, width=2 * PX, radius=0.08)
+            text(page, x + 16 * PX, y + 14 * PX + 12 * PX, k, 12 * PX, True, BLUE)
+            text(page, x + 16 * PX, y + 14 * PX + 12 * 1.3 * PX + 30 * PX, f"{v}명", 30 * PX, True)
+        y += bh + 18 * PX
+
+        cols = [("학급", .20, False), ("인원", .09, True), ("연체", .09, True)]
+        if show_active:
+            cols.append(("대여중", .11, True))
+        cols.append(("분실/파손", .11, True))
+        cols.append(("명단", 1 - sum(c[1] for c in cols), False))
+        rows = []
+        for g in classes:
+            gr = g.get("rows") or []
+            lost = cnt(gr, "분실/파손")
+            row = [(g.get("label"), True, INK), (len(gr), False, INK), (cnt(gr, "연체"), False, INK)]
+            if show_active:
+                row.append((cnt(gr, "대여중"), False, INK))
+            row.append((lost, bool(lost), RED if lost else INK))
+            row.append((", ".join((f"{_umb_num_text(r.get('number'))}. " if r.get("number") else "") + str(r.get("name", ""))
+                                  for r in gr), False, INK))
+            rows.append(row)
+        page, y = table(page, y, cols, rows, wrap_last=True)
+        foot = f"반납 기한 · {report.get('deadline', '')}　|　학급별 상세 명단은 다음 장부터 한 학급씩 이어집니다."
+        text(page, L, y + 24 * PX + 11.5 * PX, foot, 11.5 * PX, color=MUTED)
+
+    kind_color = {"연체": HEAD_TXT, "대여중": BLUE}
+    for g in classes:
+        page = new_page()
+        y = header(page, title)
+        y += 18 * PX
+        ls = 34 * PX
+        text(page, L, y + ls, g.get("label"), ls, True)
+        count = f"{len(g.get('rows') or [])}명"
+        text(page, L + width_of(g.get("label"), ls, True) + 12 * PX, y + ls, count, 16 * PX, True, BLUE)
+        y += ls * 1.25 + 12 * PX
+        cols = [("번호", .08, True), ("학번", .16, True), ("이름", .18, False), ("우산", .12, True),
+                ("반납예정일", .18, True), ("연체", .12, True), ("구분", .16, True)]
+        rows = []
+        for r in g.get("rows") or []:
+            kind = r.get("kind")
+            rows.append([
+                (_umb_num_text(r.get("number")) if r.get("number") else "-", False, INK),
+                (r.get("studentId", ""), True, INK),
+                (r.get("name", ""), True, INK),
+                ("#" + str(r.get("umbrellaCode", "")), False, INK),
+                (r.get("dueDate", ""), False, INK),
+                ((_umb_num_text(r.get("overdueDays")) + "일") if kind == "연체" else "-", False, INK),
+                (kind, kind != "연체", kind_color.get(kind, RED)),
+            ])
+        page, y = table(page, y, cols, rows)
+        notice(page, y + 24 * PX)
+
+    if doc.page_count == 0:
+        page = new_page()
+        text(page, L, T + 40, "표시할 미반납 기록이 없습니다.", 12, color=MUTED)
+
+    try:
+        doc.subset_fonts()
+    except Exception:
+        pass
+    doc.save(out_path, garbage=3, deflate=True)
+    doc.close()
+
+
+def umbrella_pdf_page_count(path):
+    if fitz is None:
+        return None
+    try:
+        with fitz.open(path) as d:
+            return d.page_count
+    except Exception:
+        return None
+
+
+def build_umbrella_report_pdf(report, out_path, class_key="", summary=True):
+    """
+    명단 PDF 를 만든다. 먼저 웹과 같은 HTML 을 브라우저로 인쇄하고,
+    안 되면 직접 그린다. 돌려주는 값: (쪽 수, "browser" | "draw")
+    """
+    html_text = umbrella_report_html(report, class_key, summary)
+    if umbrella_html_to_pdf(html_text, out_path):
+        return umbrella_pdf_page_count(out_path), "browser"
+    umbrella_report_pdf_fitz(report, out_path, class_key, summary)
+    return umbrella_pdf_page_count(out_path), "draw"
+
+
+UMBRELLA_APPS_SCRIPT_TEMPLATE = r"""
+// ===== 공용 프린터 프로그램용: 학급별 우산 미반납 명단 =====
+// 웹 '우산 미반납 명단' 과 같은 getOverdueByClass() 결과를 프린터 프로그램에 건네준다.
+//
+// 1) 이 코드를 Code.gs 맨 아래에 붙여 넣는다.
+// 2) doGet(e) 함수의 맨 첫 줄에 아래 한 줄을 넣는다.
+//      if (e && e.parameter && e.parameter.action === 'printer_overdue') return printerOverdueJson_(e);
+// 3) 배포 → 배포 관리 → 수정(연필) → 버전: 새 버전 → 배포
+//    (액세스 권한이 '모든 사용자' 여야 프린터 프로그램이 읽을 수 있다)
+//
+// 연결 키가 맞을 때만 돌려주므로 주소만 알아서는 명단을 볼 수 없다.
+
+const PRINTER_EXPORT_KEY = '__KEY__';   // 프린터 프로그램의 '연결 키'와 똑같이
+
+function printerOverdueJson_(e) {
+  const p = (e && e.parameter) || {};
+  if (String(p.key || '') !== PRINTER_EXPORT_KEY) return printerJson_({ ok: false, error: 'key' });
+  try {
+    const rep = getOverdueByClass(p.lost !== '0', p.all === '1');
+    rep.ok = true;
+    return printerJson_(rep);
+  } catch (err) {
+    return printerJson_({ ok: false, error: String(err && err.message || err) });
+  }
+}
+
+function printerJson_(obj) {
+  return ContentService.createTextOutput(JSON.stringify(obj))
+    .setMimeType(ContentService.MimeType.JSON);
+}
+""".lstrip()
+
+
+def umbrella_apps_script_code(key):
+    """Code.gs 에 붙여 넣을 코드 (연결 키를 채워서)."""
+    safe = str(key or "").replace("\\", "\\\\").replace("'", "\\'")
+    return UMBRELLA_APPS_SCRIPT_TEMPLATE.replace("__KEY__", safe)
 
 
 # -----------------------------
@@ -6681,8 +7684,18 @@ class PrinterKioskApp:
             pass
 
         if os.path.exists(get_sync_csv_path()):
-            # 이미 있는 파일이면 지금 상태를 기준으로 잡는다 (시작하자마자 덮어쓰지 않도록)
-            _sync_csv_state["stamp"] = _csv_stamp(get_sync_csv_path())
+            if sync_csv_edited_while_closed():
+                # 프로그램이 꺼져 있는 동안 엑셀 등에서 고친 파일 → 지금 반영한다.
+                # (예전에는 이 변경을 무시하고 지나가서, 다음 저장 때 그대로 덮어써졌다)
+                try:
+                    load_sync_csv()
+                except Exception:
+                    _sync_csv_state["stamp"] = _csv_stamp(get_sync_csv_path())
+            else:
+                # 마지막으로 맞춰 둔 그대로면 기준만 잡는다 (시작하자마자 덮어쓰지 않도록)
+                _sync_csv_state["stamp"] = _csv_stamp(get_sync_csv_path())
+                if _saved_sync_stamp() is None:
+                    _remember_sync_stamp(get_sync_csv_path())
         else:
             write_sync_csv()
 
@@ -8818,7 +9831,7 @@ class PrinterKioskApp:
                 try:
                     path = render_pdf_page_thumbnail(file_path, page_num - 1, max_width=760)
                 except Exception as e:
-                    self.root.after(0, lambda: status.configure(text=str(e)))
+                    self.root.after(0, lambda msg=str(e): status.configure(text=msg))
                     return
                 self.root.after(0, lambda: place(path))
 
@@ -9273,14 +10286,25 @@ class PrinterKioskApp:
                 btn.configure(state="disabled", text=f"{text}  🔒")
             btn.grid(row=row, column=col, padx=10, pady=10)
 
-        # 관리자 방식 · 명단 · 작업 기록 (두 칸을 합친 넓은 버튼)
+        last_row = len(buttons) // 2
+
+        # 우산 대여 시스템의 연체자 명단 (학생회 우산 대여 · 구글 시트)
+        umbrella_btn = self.secondary_button(
+            grid_frame, "☂  우산 연체자 명단", self.umbrella_overdue_screen,
+            width=340, height=64, font_size=18
+        )
+        if not admin_has_permission("umbrella"):
+            umbrella_btn.configure(state="disabled", text="☂  우산 연체자 명단  🔒")
+        umbrella_btn.grid(row=last_row, column=0, padx=10, pady=10)
+
+        # 관리자 방식 · 명단 · 작업 기록
         account_btn = self.secondary_button(
             grid_frame, "관리자 계정 · 작업 기록", self.admin_account_screen,
-            width=700, height=56, font_size=17
+            width=340, height=64, font_size=18
         )
         if not can_manage:
-            account_btn.configure(state="disabled", text="관리자 계정 · 작업 기록 (총괄 전용)")
-        account_btn.grid(row=len(buttons) // 2, column=0, columnspan=2, padx=10, pady=(6, 10))
+            account_btn.configure(state="disabled", text="관리자 계정 (총괄 전용)  🔒")
+        account_btn.grid(row=last_row, column=1, padx=10, pady=10)
 
         bottom_frame = ctk.CTkFrame(card, fg_color="transparent")
         bottom_frame.pack()
@@ -9393,7 +10417,7 @@ class PrinterKioskApp:
                         card_code,
                         student_number or "",
                         name,
-                        "예" if unlimited else "아니오",
+                        "예" if unlimited else "아니요",
                         "사용 가능" if active else "사용 중지",
                         created
                     )
@@ -9683,12 +10707,22 @@ class PrinterKioskApp:
         self.secondary_button(file_btn_frame, "명단 CSV 내보내기", export_users, width=200, height=42, font_size=16).grid(row=0, column=1, padx=5)
         self.secondary_button(file_btn_frame, "연동 CSV 열기", open_sync_csv, width=170, height=42, font_size=16).grid(row=0, column=2, padx=5)
 
-        self.body_label(
+        sync_label = self.body_label(
             card,
             f"{get_sync_csv_name()} 실시간 연동 중  ·  파일을 고쳐 저장하면 몇 초 안에 명단에 반영됩니다 "
             "(줄을 지워도 삭제되지는 않습니다)",
             size=13, muted=True
-        ).pack(pady=(0, 6))
+        )
+        sync_label.pack(pady=(0, 6))
+
+        # 명단 파일을 쓰지 못하고 있으면 (엑셀에서 열려 있음 · 폴더 쓰기 권한 없음) 붉게 알린다.
+        # 이 상태에서는 파일을 고쳐도 반영이 꼬일 수 있다.
+        if _sync_csv_state.get("write_failed"):
+            sync_label.configure(
+                text=f"{get_sync_csv_name()} 을(를) 저장하지 못했습니다  ·  엑셀에서 파일을 닫거나, "
+                     f"프로그램 폴더에 쓰기 권한이 있는지 확인하세요  ({get_program_dir()})",
+                text_color=COLOR_DANGER
+            )
 
         self.link_button(card, "관리자 메뉴로", self.admin_menu, width=180, height=38).pack()
 
@@ -11614,14 +12648,14 @@ class PrinterKioskApp:
             try:
                 path = download_update(info["url"], on_progress)
             except Exception as e:
-                self.root.after(0, lambda: fail(f"다운로드에 실패했습니다.\n\n{e}"))
+                self.root.after(0, lambda msg=f"다운로드에 실패했습니다.\n\n{e}": fail(msg))
                 return
 
             try:
                 admin_log("프로그램 업데이트", f"v{APP_VERSION} → v{info.get('version', '?')}")
                 apply_update(path)
             except Exception as e:
-                self.root.after(0, lambda: fail(str(e)))
+                self.root.after(0, lambda msg=str(e): fail(msg))
                 return
 
             self.root.after(0, done)
@@ -11890,6 +12924,409 @@ class PrinterKioskApp:
         self.link_button(bottom, "출력 파일 설정으로", self.limit_setting_screen, width=190, height=42).grid(row=0, column=1, padx=8)
 
         refresh_drives()
+
+    # ==========================================================
+    # 우산 연체자 명단 — 학급별 (웹 '우산 미반납 명단' 과 같은 모양)
+    # ==========================================================
+    def umbrella_overdue_screen(self, reload=None):
+        """
+        학급별 우산 연체자 명단을 웹 명단과 같은 모양으로 인쇄 / PDF 저장.
+        학생 출력 횟수 · 장수에는 들어가지 않는다. 작업 기록에는 남는다.
+        reload=None 이면 연결 주소가 있을 때 화면을 열면서 바로 불러온다.
+        """
+        if not self.require_perm("umbrella"):
+            return
+
+        state = getattr(self, "_umbrella_state", None)
+        if state is None:
+            state = self._umbrella_state = {"report": None, "source": "", "file_rows": None, "file_name": ""}
+
+        url = get_setting("umbrella_url", "").strip()
+        if reload is None:
+            reload = bool(url) and state["report"] is None or (bool(url) and state["source"] == "web")
+
+        card = self.build_card()
+        self.make_title(card, "우산 연체자 명단")
+
+        msg = ctk.CTkLabel(card, text="", font=(self.font_family, 14), corner_radius=10,
+                           wraplength=1040, justify="center", height=40)
+        msg.pack(fill="x", pady=(0, 12))
+
+        def set_msg(kind, text):
+            colors = {
+                "err": ("#FFE3E3", "#B4341F"),
+                "ok": ("#DFF5E6", "#0E5A3A"),
+                "info": ("#FFF6D8", "#7A5B00"),
+            }
+            bg, fg = colors.get(kind, colors["info"])
+            msg.configure(text=text, fg_color=bg, text_color=fg)
+
+        # ---- 조작 줄 (웹 명단 위쪽 막대와 같은 항목) ----
+        bar = ctk.CTkFrame(card, fg_color="transparent")
+        bar.pack(pady=(0, 10))
+
+        scope_labels = {"overdue": "연체자만", "all": "미반납자 전체 (기한 전 포함)"}
+        scope_var = tk.StringVar(value=scope_labels["all"] if get_setting("umbrella_all", "0") == "1" else scope_labels["overdue"])
+        lost_var = tk.IntVar(value=0 if get_setting("umbrella_lost", "1") == "0" else 1)
+        summary_var = tk.IntVar(value=0 if get_setting("umbrella_summary", "1") == "0" else 1)
+        class_var = tk.StringVar(value="전체 학급")
+        class_keys = {"전체 학급": ""}
+
+        def opts():
+            return lost_var.get() == 1, scope_var.get() == scope_labels["all"]
+
+        seg_style = dict(
+            height=40, corner_radius=10, border_width=3,
+            font=(self.font_family, 14, "bold"),
+            fg_color=COLOR_SECONDARY_BG, selected_color=COLOR_CARD, selected_hover_color=COLOR_CARD,
+            unselected_color=COLOR_SECONDARY_BG, unselected_hover_color=COLOR_SECONDARY_BG_HOVER,
+            text_color=COLOR_TEXT
+        )
+        check_style = dict(font=(self.font_family, 15), text_color=COLOR_TEXT,
+                           fg_color=COLOR_PRIMARY, hover_color=COLOR_PRIMARY_HOVER, onvalue=1, offvalue=0)
+
+        def on_options_changed(*_):
+            include_lost, include_all = opts()
+            set_setting("umbrella_lost", "1" if include_lost else "0")
+            set_setting("umbrella_all", "1" if include_all else "0")
+            reload_data()
+
+        ctk.CTkSegmentedButton(bar, values=list(scope_labels.values()), variable=scope_var,
+                               command=on_options_changed, **seg_style).grid(row=0, column=0, padx=6)
+        ctk.CTkCheckBox(bar, text="분실/파손 포함", variable=lost_var, command=on_options_changed,
+                        **check_style).grid(row=0, column=1, padx=(14, 6))
+
+        def on_summary():
+            set_setting("umbrella_summary", str(summary_var.get()))
+
+        ctk.CTkCheckBox(bar, text="요약 페이지", variable=summary_var, command=on_summary,
+                        **check_style).grid(row=0, column=2, padx=6)
+
+        def on_class(_value=None):
+            refresh_table()
+
+        class_menu = ctk.CTkOptionMenu(
+            bar, variable=class_var, values=["전체 학급"], command=on_class, width=210, height=40,
+            font=(self.font_family, 15), dropdown_font=(self.font_family, 15),
+            fg_color=COLOR_ENTRY_BG, button_color=COLOR_SECONDARY_BG,
+            button_hover_color=COLOR_SECONDARY_BG_HOVER, text_color=COLOR_TEXT
+        )
+        class_menu.grid(row=0, column=3, padx=(14, 0))
+
+        # ---- 표 ----
+        columns = ("c1", "c2", "c3", "c4", "c5", "c6", "c7", "c8")
+        tree = ttk.Treeview(card, columns=columns, show="headings", height=8, style="App.Treeview")
+        headings = ["학급", "번호", "학번", "이름", "우산", "반납예정일", "연체", "구분"]
+        widths = [150, 70, 110, 130, 100, 150, 80, 120]
+        for i, (h, w) in enumerate(zip(headings, widths), start=1):
+            tree.heading(f"c{i}", text=h)
+            tree.column(f"c{i}", width=w, minwidth=w, stretch=False, anchor="center")
+        tree.tag_configure("lost", foreground="#B4341F")
+        tree.tag_configure("active", foreground="#1346C8")
+        tree.pack(pady=(0, 14))
+
+        def fill_class_menu():
+            report = state["report"]
+            keep = class_keys.get(class_var.get(), "")
+            class_keys.clear()
+            class_keys["전체 학급"] = ""
+            values = ["전체 학급"]
+            for g in (report or {}).get("classes", []):
+                label = f"{g.get('label')} ({len(g.get('rows') or [])}명)"
+                class_keys[label] = g.get("key")
+                values.append(label)
+            class_menu.configure(values=values)
+            pick = next((lab for lab, k in class_keys.items() if k == keep), "전체 학급")
+            class_var.set(pick)
+
+        def refresh_table():
+            for iid in tree.get_children():
+                tree.delete(iid)
+            report = state["report"]
+            has = bool(report and report.get("total"))
+            if report:
+                for g in umbrella_visible_classes(report, class_keys.get(class_var.get(), "")):
+                    for r in g.get("rows") or []:
+                        kind = r.get("kind")
+                        tree.insert("", "end", values=(
+                            g.get("label"),
+                            _umb_num_text(r.get("number")) if r.get("number") else "-",
+                            r.get("studentId"), r.get("name"), f"#{r.get('umbrellaCode')}",
+                            r.get("dueDate"),
+                            f"{_umb_num_text(r.get('overdueDays'))}일" if kind == "연체" else "-",
+                            kind,
+                        ), tags=("lost",) if kind not in ("연체", "대여중") else (("active",) if kind == "대여중" else ()))
+            print_btn.configure(state="normal" if has else "disabled")
+            pdf_btn.configure(state="normal" if has else "disabled")
+
+        def apply_report(report, source, label=""):
+            state["report"] = report
+            state["source"] = source
+            fill_class_menu()
+            refresh_table()
+            origin = "우산 웹앱" if source == "web" else f"파일 {label}"
+            if not report.get("total"):
+                set_msg("ok", f"✅ 현재 미반납 우산이 없습니다.  ({origin})")
+            else:
+                set_msg("ok", umbrella_status_text(report) + f"  ({origin})")
+
+        def reload_data():
+            if state["source"] == "file" and state["file_rows"] is not None:
+                include_lost, include_all = opts()
+                apply_report(umbrella_report_from_rows(state["file_rows"], include_lost, include_all),
+                             "file", state["file_name"])
+                return
+            load_from_web()
+
+        def load_from_web():
+            target_url = get_setting("umbrella_url", "").strip()
+            if not target_url:
+                set_msg("info", "우산 웹앱과 아직 연결하지 않았습니다. '연결 설정' 을 누르거나, "
+                                "'대여기록' 시트를 CSV · XLSX 로 내려받아 '파일에서 불러오기' 를 누르세요.")
+                refresh_table()
+                return
+            key = get_setting("umbrella_key", "")
+            include_lost, include_all = opts()
+            reload_btn.configure(state="disabled")
+            set_msg("info", "불러오는 중...")
+
+            def worker():
+                try:
+                    result = ("ok", umbrella_fetch_report(target_url, key, include_lost, include_all))
+                except Exception as e:
+                    result = ("error", str(e))
+
+                def done():
+                    try:
+                        if not tree.winfo_exists():
+                            return
+                    except Exception:
+                        return
+                    reload_btn.configure(state="normal")
+                    if result[0] == "error":
+                        set_msg("err", "오류: " + result[1])
+                        refresh_table()
+                        return
+                    state["file_rows"] = None
+                    apply_report(result[1], "web")
+
+                try:
+                    self.root.after(0, done)
+                except Exception:
+                    pass
+
+            threading.Thread(target=worker, daemon=True).start()
+
+        def load_from_file():
+            path = filedialog.askopenfilename(
+                title="'대여기록' 시트 파일 고르기",
+                filetypes=[("CSV · 엑셀", "*.csv *.xlsx *.xlsm"), ("모든 파일", "*.*")]
+            )
+            if not path:
+                return
+            try:
+                rows = umbrella_read_rental_file(path)
+            except Exception as e:
+                set_msg("err", "오류: " + str(e).split("\n")[0])
+                messagebox.showerror("파일을 읽지 못함", str(e))
+                return
+            state["file_rows"] = rows
+            state["file_name"] = os.path.basename(path)
+            include_lost, include_all = opts()
+            apply_report(umbrella_report_from_rows(rows, include_lost, include_all), "file", state["file_name"])
+
+        # ---- 불러오기 단추 ----
+        load_row = ctk.CTkFrame(card, fg_color="transparent")
+        load_row.pack(pady=(0, 4))
+        reload_btn = self.secondary_button(load_row, "다시 불러오기", lambda: (state.update({"source": "web"}), load_from_web()),
+                                           width=150, height=42, font_size=15)
+        reload_btn.grid(row=0, column=0, padx=6)
+        self.secondary_button(load_row, "파일에서 불러오기", load_from_file, width=170, height=42, font_size=15).grid(row=0, column=1, padx=6)
+        self.secondary_button(load_row, "연결 설정", self.umbrella_connect_screen, width=120, height=42, font_size=15).grid(row=0, column=2, padx=6)
+
+        ctk.CTkFrame(load_row, fg_color=COLOR_BORDER, width=1, height=34).grid(row=0, column=3, padx=12)
+
+        # ---- 인쇄 · 저장 ----
+        def make_pdf(path):
+            return build_umbrella_report_pdf(
+                state["report"], path, class_keys.get(class_var.get(), ""), summary_var.get() == 1)
+
+        def scope_text():
+            report = state["report"] or {}
+            classes = umbrella_visible_classes(report, class_keys.get(class_var.get(), ""))
+            people = sum(len(g.get("rows") or []) for g in classes)
+            which = class_var.get().split(" (")[0]
+            return f"{which} · {len(classes)}개 학급 · {people}명", people
+
+        def do_print():
+            printer_name = get_setting("selected_printer", "")
+            if not printer_name:
+                messagebox.showwarning("프린터 없음", "선택된 프린터가 없습니다. '프린터 설정' 에서 먼저 고르세요.")
+                return
+            text, people = scope_text()
+            set_msg("info", "명단을 만드는 중...")
+            self.root.update_idletasks()
+            out = os.path.join(tempfile.gettempdir(), f"우산명단_{datetime.now():%Y%m%d_%H%M%S}.pdf")
+            try:
+                pages, how = make_pdf(out)
+                send_pdf_to_printer(out, printer_name)
+            except Exception as e:
+                set_msg("err", "오류: " + str(e).split("\n")[0])
+                messagebox.showerror("인쇄 실패", str(e))
+                return
+            finally:
+                try:
+                    self.root.after(60000, lambda p=out: os.path.exists(p) and os.remove(p))
+                except Exception:
+                    pass
+            admin_log("우산 명단 인쇄", f"{text} · {pages or '?'}쪽")
+            set_msg("ok", f"인쇄를 보냈습니다. {text} · {pages or '?'}쪽"
+                    + ("" if how == "browser" else "  (브라우저를 쓸 수 없어 직접 그린 모양)"))
+
+        def do_save():
+            report = state["report"] or {}
+            path = filedialog.asksaveasfilename(
+                title="PDF로 저장",
+                defaultextension=".pdf",
+                initialfile=f"{umbrella_doc_title(report)} {report.get('asOfDate', '')}.pdf",
+                filetypes=[("PDF", "*.pdf")]
+            )
+            if not path:
+                return
+            text, _ = scope_text()
+            set_msg("info", "PDF를 만드는 중...")
+            self.root.update_idletasks()
+            try:
+                pages, how = make_pdf(path)
+            except Exception as e:
+                set_msg("err", "오류: " + str(e).split("\n")[0])
+                messagebox.showerror("저장 실패", str(e))
+                return
+            admin_log("우산 명단 PDF 저장", f"{text} · {pages or '?'}쪽 · {os.path.basename(path)}")
+            set_msg("ok", f"저장했습니다. {path}")
+
+        pdf_btn = self.secondary_button(load_row, "PDF 저장", do_save, width=130, height=42, font_size=15,
+                                        fg_color="#0E7C66", hover_color="#0B6553")
+        pdf_btn.configure(text_color="white")
+        pdf_btn.grid(row=0, column=4, padx=6)
+        print_btn = self.primary_button(load_row, "인쇄", do_print, width=130, height=42, font_size=16)
+        print_btn.grid(row=0, column=5, padx=6)
+
+        self.link_button(card, "관리자 메뉴로", self.admin_menu, width=170, height=40).pack(pady=(10, 0))
+
+        if state["report"] is not None:
+            fill_class_menu()
+            refresh_table()
+            if state["source"] == "file":
+                set_msg("ok", umbrella_status_text(state["report"]) + f"  (파일 {state['file_name']})")
+        else:
+            refresh_table()
+
+        if reload and state["source"] != "file":
+            load_from_web()
+        elif state["report"] is None:
+            load_from_web()   # 주소가 없으면 안내만 띄운다
+
+    def umbrella_connect_screen(self):
+        """우산 대여 웹앱(Apps Script)과 연결하는 설정."""
+        if not self.require_perm("umbrella"):
+            return
+
+        card = self.build_card()
+        self.make_title(card, "우산 웹앱 연결 설정")
+
+        self.body_label(
+            card,
+            "① 'Apps Script 코드 복사' 를 눌러 우산 웹앱 Code.gs 맨 아래에 붙여 넣습니다.\n"
+            "② doGet(e) 함수 맨 첫 줄에 아래 한 줄을 넣습니다.\n"
+            "      if (e && e.parameter && e.parameter.action === 'printer_overdue') return printerOverdueJson_(e);\n"
+            "③ 배포 → 배포 관리 → 수정 → 새 버전으로 배포 (액세스 권한: 모든 사용자) 후 /exec 주소를 아래에 넣습니다.",
+            size=13, muted=True, justify="left", wraplength=1040
+        ).pack(pady=(0, 16))
+
+        form = ctk.CTkFrame(card, fg_color=COLOR_ENTRY_BG, corner_radius=16)
+        form.pack(pady=(0, 16), ipadx=20, ipady=16)
+
+        self.body_label(form, "웹앱 주소 (/exec)", size=15, muted=True).grid(row=0, column=0, padx=12, pady=8, sticky="e")
+        url_entry = self.make_entry(form, width=640, height=44, font_size=14, justify="left")
+        url_entry.grid(row=0, column=1, padx=12, pady=8)
+        url_entry.insert(0, get_setting("umbrella_url", ""))
+
+        key = get_setting("umbrella_key", "")
+        if not key:
+            import secrets
+            key = secrets.token_urlsafe(12)
+        self.body_label(form, "연결 키", size=15, muted=True).grid(row=1, column=0, padx=12, pady=8, sticky="e")
+        key_entry = self.make_entry(form, width=640, height=44, font_size=14, justify="left")
+        key_entry.grid(row=1, column=1, padx=12, pady=8)
+        key_entry.insert(0, key)
+
+        self.body_label(
+            form,
+            "연결 키는 아무 글자나 괜찮지만 Code.gs 의 PRINTER_EXPORT_KEY 와 똑같아야 합니다. (코드 복사 때 자동으로 채워짐)",
+            size=12, muted=True
+        ).grid(row=2, column=0, columnspan=2, pady=(6, 0))
+
+        result_label = self.body_label(card, "", size=14, bold=True, wraplength=1000)
+        result_label.pack(pady=(0, 10))
+
+        def save(silent=False):
+            set_setting("umbrella_url", url_entry.get().strip())
+            set_setting("umbrella_key", key_entry.get().strip())
+            if not silent:
+                result_label.configure(text="저장했습니다.", text_color=COLOR_SUCCESS)
+
+        def copy_code():
+            code = umbrella_apps_script_code(key_entry.get().strip())
+            try:
+                self.root.clipboard_clear()
+                self.root.clipboard_append(code)
+                self.root.update()
+            except Exception:
+                pass
+            save(silent=True)
+            result_label.configure(
+                text="Apps Script 코드를 복사했습니다. Code.gs 맨 아래에 붙여 넣으세요. (연결 키도 저장했습니다)",
+                text_color=COLOR_SUCCESS
+            )
+
+        def test():
+            save(silent=True)
+            target = url_entry.get().strip()
+            if not target:
+                result_label.configure(text="웹앱 주소를 넣어 주세요.", text_color=COLOR_DANGER)
+                return
+            result_label.configure(text="연결하는 중...", text_color=COLOR_TEXT_MUTED)
+
+            def worker():
+                try:
+                    rep = umbrella_fetch_report(target, key_entry.get().strip(), True, False)
+                    text = "연결 성공 · " + umbrella_status_text(rep)
+                    color = COLOR_SUCCESS
+                except Exception as e:
+                    text, color = str(e), COLOR_DANGER
+
+                def done():
+                    try:
+                        result_label.configure(text=text, text_color=color)
+                    except Exception:
+                        pass
+                try:
+                    self.root.after(0, done)
+                except Exception:
+                    pass
+
+            threading.Thread(target=worker, daemon=True).start()
+
+        row = ctk.CTkFrame(card, fg_color="transparent")
+        row.pack()
+        self.secondary_button(row, "Apps Script 코드 복사", copy_code, width=220, height=46, font_size=15).grid(row=0, column=0, padx=6)
+        self.secondary_button(row, "연결 시험", test, width=140, height=46, font_size=15).grid(row=0, column=1, padx=6)
+        self.primary_button(row, "저장하고 돌아가기",
+                            lambda: (save(silent=True), self.umbrella_overdue_screen(reload=True)),
+                            width=200, height=46, font_size=15).grid(row=0, column=2, padx=6)
+        self.link_button(row, "취소", lambda: self.umbrella_overdue_screen(reload=False),
+                         width=110, height=44).grid(row=0, column=3, padx=6)
 
     def kiosk_setting_screen(self):
         """
